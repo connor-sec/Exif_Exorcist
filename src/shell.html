@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src blob: data:; media-src blob:; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; worker-src 'none'">
+<title>Exif Exorcist v1.0</title>
+<style>
+:root {
+  --bg: #101410;
+  --surface: #181e1a;
+  --surface-2: #202820;
+  --line: #314036;
+  --text: #e7f2ea;
+  --muted: #93a79a;
+  --accent: #9be7b8;
+  --accent-dim: #1c3a2a;
+  --gps-bg: #3a2c12;
+  --gps-fg: #ffd98a;
+  --serial-bg: #3a1c22;
+  --serial-fg: #ffb7c0;
+  --bad: #ff9b9b;
+  --warn: #e6c98a;
+  --shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, #1a2e22 0%, transparent 55%),
+    var(--bg);
+  color: var(--text);
+  font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.skip {
+  position: absolute;
+  left: 12px;
+  top: -40px;
+  background: var(--accent);
+  color: #102016;
+  padding: 8px 12px;
+  z-index: 2;
+}
+.skip:focus { top: 12px; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 64px; }
+header.top h1 {
+  font-family: Georgia, "Iowan Old Style", Palatino, serif;
+  font-weight: 500;
+  font-size: 2.4rem;
+  letter-spacing: -0.03em;
+  margin: 0 0 6px;
+}
+header.top p.lede { margin: 0; color: var(--muted); max-width: 62ch; }
+.version {
+  display: inline-block;
+  margin-left: 8px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  vertical-align: 0.45em;
+  color: var(--accent);
+  border: 1px solid #2f6a48;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.notice, .panel, .card, details.formats {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+.notice { margin: 22px 0; padding: 14px 16px; }
+.notice h2 { margin: 0 0 6px; font-size: 0.95rem; }
+.notice p { margin: 0; color: var(--muted); }
+.panel { padding: 16px; margin: 16px 0; }
+.drop {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1.5px dashed #3e5a48;
+  border-radius: 14px;
+  padding: 28px 20px;
+  font: inherit;
+}
+.drop strong { display: block; font-size: 1.15rem; margin-bottom: 4px; }
+.drop span { color: var(--muted); }
+.drop.hot, .drop:hover { border-color: var(--accent); background: #1a2b22; }
+fieldset { border: 0; margin: 16px 0 0; padding: 0; }
+legend { font-weight: 650; margin-bottom: 8px; }
+.choice { display: flex; gap: 10px; align-items: flex-start; margin: 8px 0; }
+.choice input { margin-top: 0.35em; }
+.warning {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #2a2416;
+  color: var(--warn);
+  border: 1px solid #5c4a22;
+}
+#mode-note { min-height: 1.5em; color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+button, .drop {
+  font: inherit;
+}
+button {
+  background: var(--accent);
+  color: #102016;
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-weight: 650;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.ghost, button.secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+#status { color: var(--muted); min-height: 1.5em; }
+#summary { font-weight: 650; }
+.card { margin: 14px 0; padding: 16px; box-shadow: var(--shadow); }
+.card-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.card h3 { margin: 0; font-size: 1.05rem; word-break: break-all; }
+.card h4 { margin: 16px 0 8px; font-size: 0.82rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+.pill, .flag {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.75rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.pill.ok { color: var(--accent); border-color: #2f6a48; }
+.pill.warn { color: var(--warn); border-color: #5c4a22; }
+.flag { margin-left: 6px; font-weight: 700; }
+tr.gps .flag { background: var(--gps-bg); color: var(--gps-fg); border-color: #6d5420; }
+tr.serial .flag { background: var(--serial-bg); color: var(--serial-fg); border-color: #6d303c; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 650; }
+tr.gps { background: var(--gps-bg); }
+tr.serial { background: var(--serial-bg); }
+.verdict { padding: 10px 12px; border-radius: 10px; margin: 12px 0; }
+.verdict.clear { background: var(--accent-dim); color: var(--accent); }
+.verdict.unverified { background: #2a2416; color: var(--warn); }
+.verdict.residual, .verdict.failed { background: #3a1c1c; color: var(--bad); }
+.notes { margin: 8px 0 12px; color: var(--muted); padding-left: 1.1em; }
+.none { color: var(--muted); }
+details.formats { padding: 12px 16px; margin-top: 18px; }
+details.formats table { margin-top: 8px; }
+footer { margin-top: 28px; color: var(--muted); font-size: 0.9rem; }
+footer a { color: var(--accent); }
+.sr {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); border: 0;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (max-width: 640px) {
+  header.top h1 { font-size: 2rem; }
+  .wrap { padding: 20px 14px 48px; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#file-list">Skip to files</a>
+<main class="wrap">
+<header class="top">
+  <h1>Exif Exorcist <span class="version">v1.0</span></h1>
+  <p class="lede">An offline, single-file tool that strips metadata in your browser. No install, no server, nothing leaves the page.</p>
+</header>
+<section class="notice" aria-labelledby="auth-heading">
+  <h2 id="auth-heading">Authorized use only</h2>
+  <p>Use this on files you are allowed to modify. It rewrites bytes you give it. It does not upload them, and it does not redact what a person can see in the picture or on the page. A result of “No metadata detected” is what the re-scan measured for a fully supported format. Best-effort formats are never given that result. Check anything you depend on with another tool, such as exiftool.</p>
+</section>
+<section class="panel" aria-labelledby="add-heading">
+  <h2 id="add-heading" class="sr">Add files</h2>
+  <button type="button" class="drop" id="drop" aria-describedby="drop-help">
+    <strong>Drop files here</strong>
+    <span id="drop-help">or press Enter to choose files. Several at once is fine. The type comes from the bytes, not the extension.</span>
+  </button>
+  <input id="file-input" class="sr" type="file" multiple aria-label="Choose files">
+  <fieldset>
+    <legend>How to strip</legend>
+    <label class="choice"><input type="radio" name="mode" value="lossless" checked> <span><strong>Lossless.</strong> Remove metadata segments, chunks, and atoms. Image and audio data stay encoded as they were.</span></label>
+    <label class="choice"><input type="radio" name="mode" value="canvas" aria-describedby="canvas-warning"> <span><strong>Canvas re-encode for images.</strong> Decode the picture and write a new PNG.</span></label>
+    <p class="warning" id="canvas-warning">Canvas re-encode throws the original file away and builds a new PNG from pixels. Metadata does not carry over, but quality can drop, color can shift, bit depth is flattened, and animations keep only the first frame. Use it when you accept that loss, or when a best-effort container still shows metadata.</p>
+    <p id="mode-note" aria-live="polite"></p>
+  </fieldset>
+  <div class="actions">
+    <button type="button" id="strip" disabled>Strip and re-scan</button>
+    <button type="button" id="zip" class="secondary" disabled>Download zip</button>
+  </div>
+  <p id="status" role="status" aria-live="polite"></p>
+  <p id="summary" aria-live="polite"></p>
+</section>
+<section aria-labelledby="results-heading">
+  <h2 id="results-heading" class="sr">Files</h2>
+  <p id="empty">No files yet.</p>
+  <div id="file-list"></div>
+</section>
+<details class="formats">
+  <summary>Supported formats in v1.0</summary>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th scope="col">Format</th><th scope="col">Lossless behavior</th><th scope="col">Level</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">JPEG</th><td>Removes APP segments, except the Adobe APP14 color marker, and comments.</td><td>Full</td></tr>
+      <tr><th scope="row">PNG</th><td>Removes text, time, EXIF, ICC, and other non-rendering chunks.</td><td>Full</td></tr>
+      <tr><th scope="row">WebP</th><td>Removes EXIF, XMP, and ICC chunks and clears those VP8X flags.</td><td>Full</td></tr>
+      <tr><th scope="row">GIF</th><td>Removes comments and application extensions, and keeps animation blocks.</td><td>Full</td></tr>
+      <tr><th scope="row">TIFF</th><td>Rebuilds baseline TIFF IFDs with image tags only. BigTIFF is refused.</td><td>Full</td></tr>
+      <tr><th scope="row">HEIC</th><td>Zeros known Exif and XMP item extents. Offsets stay put.</td><td>Best effort</td></tr>
+      <tr><th scope="row">PDF</th><td>Rewrites unencrypted files, clears Info and XMP, strips embedded JPEG EXIF.</td><td>Full when the file parses</td></tr>
+      <tr><th scope="row">DOCX, XLSX, PPTX</th><td>Drops docProps, clears author attributes, strips embedded images.</td><td>Full</td></tr>
+      <tr><th scope="row">ODT, ODS, ODP</th><td>Replaces meta.xml with an empty office:meta.</td><td>Full</td></tr>
+      <tr><th scope="row">MP3</th><td>Removes ID3v2, ID3v1, and APEv2.</td><td>Full</td></tr>
+      <tr><th scope="row">MP4, MOV, M4A</th><td>Removes user-data, iTunes metadata, and XMP, then fixes chunk offsets.</td><td>Best effort</td></tr>
+    </tbody>
+  </table>
+  </div>
+</details>
+<footer>
+  <p>Exif Exorcist v1.0. Maintained by @connor-sec. Released under the GNU Affero General Public License v3.0. Color profiles are removed on purpose, so colors may shift. This page does not claim a file is clean when a re-scan still finds metadata, and it does not certify best-effort formats.</p>
+</footer>
+</main>
+<script>
+/* EXIF_EXORCIST_ENGINE_START */
+@@ENGINE@@
+/* EXIF_EXORCIST_ENGINE_END */
+</script>
+<script>
+/* EXIF_EXORCIST_UI_START */
+@@UI@@
+/* EXIF_EXORCIST_UI_END */
+</script>
+</body>
+</html>
