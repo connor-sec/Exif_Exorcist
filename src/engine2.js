@@ -88,19 +88,26 @@
       return v;
     }
     var out = [];
+    /* The counts come from the file. Stop at the end of the box instead of
+       trusting a count that can claim four billion items. */
     for (var i = 0; i < num; i++) {
+      if (pos + 6 > payload.length) break;
       var id = ver < 2 ? u16be(payload, pos) : u32be(payload, pos);
       pos += ver < 2 ? 2 : 4;
       var construction = 0;
       if (ver === 1 || ver === 2) { construction = u16be(payload, pos) & 15; pos += 2; }
       var dataRef = u16be(payload, pos); pos += 2;
       var base = getVar(nbas);
+      if (pos + 2 > payload.length) break;
       var extNum = u16be(payload, pos); pos += 2;
       var extents = [];
+      var whole = true;
       for (var j = 0; j < extNum; j++) {
+        if (pos + ((ver === 1 || ver === 2) ? nind : 0) + noff + nlen > payload.length) { whole = false; break; }
         if ((ver === 1 || ver === 2) && nind) getVar(nind);
         extents.push({ offset: getVar(noff), length: getVar(nlen) });
       }
+      if (!whole) break;
       out.push({ id: id, construction: construction, dataRef: dataRef, base: base, extents: extents });
     }
     return out;
@@ -267,8 +274,21 @@
     return true;
   }
 
+  /* ISO files write meta as a FullBox (4 bytes of version and flags before the
+     children). QuickTime files often write it as a plain atom with the children
+     right after the header. A FullBox starts with 00 00 00 00, which is never a
+     valid child size, so the first word tells the two apart. */
+  function metaChildStart(bytes, box) {
+    var body = box.start + box.header;
+    if (body + 8 <= box.end) {
+      var first = u32be(bytes, body);
+      if (first >= 8 && body + first <= box.end) return body;
+    }
+    return Math.min(box.end, body + 4);
+  }
+
   function metaIsMetadata(bytes, box) {
-    var children = parseBoxes(bytes, box.start + box.header + 4, box.end);
+    var children = parseBoxes(bytes, metaChildStart(bytes, box), box.end);
     for (var i = 0; i < children.length; i++) {
       var c = children[i];
       if (c.type === 'ilst' || c.type === 'keys') return true;
@@ -317,10 +337,50 @@
           items.push.apply(items, parseXmp(bytes.subarray(b.start + b.header, b.end), 'MP4 XMP'));
         }
         if (MP4_CONTAINERS[b.type] || b.type === 'ilst') walk(b.start + b.header, b.end);
-        else if (b.type === 'meta') walk(b.start + b.header + 4, b.end);
+        else if (b.type === 'meta') {
+          var cs = metaChildStart(bytes, b);
+          items.push.apply(items, scanQtKeys(bytes, cs, b.end));
+          walk(cs, b.end);
+        }
       }
     }
     walk(0, bytes.length);
+    return items;
+  }
+
+  /* Key-based QuickTime metadata (meta > keys + ilst). This is where phones
+     write make, model, software, creation date, and the ISO 6709 location. */
+  function scanQtKeys(bytes, start, end) {
+    var items = [];
+    var children = parseBoxes(bytes, start, end);
+    var keys = null;
+    var ilst = null;
+    for (var i = 0; i < children.length; i++) {
+      if (children[i].type === 'keys') keys = children[i];
+      if (children[i].type === 'ilst') ilst = children[i];
+    }
+    if (!keys || !ilst) return items;
+    var names = [];
+    var q = keys.start + keys.header + 8;
+    while (q + 8 <= keys.end && names.length < 1000) {
+      var ksize = u32be(bytes, q);
+      if (ksize < 8 || q + ksize > keys.end) break;
+      names.push(latin1(bytes.subarray(q + 8, q + ksize)));
+      q += ksize;
+    }
+    var entries = parseBoxes(bytes, ilst.start + ilst.header, ilst.end);
+    for (var e = 0; e < entries.length; e++) {
+      var name = names[u32be(bytes, entries[e].start + 4) - 1];
+      if (!name) continue;
+      var kids = parseBoxes(bytes, entries[e].start + entries[e].header, entries[e].end);
+      for (var k = 0; k < kids.length; k++) {
+        if (kids[k].type !== 'data') continue;
+        var raw = bytes.subarray(Math.min(kids[k].end, kids[k].start + kids[k].header + 8), kids[k].end);
+        var text = new TextDecoder('utf-8', { fatal: false }).decode(raw).replace(/[\u0000-\u001f]/g, ' ').trim();
+        if (!text || /�/.test(text)) text = '(' + raw.length + ' bytes)';
+        items.push(item(name.replace(/^com\.apple\.quicktime\./, ''), text, 'QuickTime', 'MP4 keys'));
+      }
+    }
     return items;
   }
 
@@ -333,8 +393,42 @@
     for (var i = 0; i < n; i++) copy[header + 4 + i] = 0;
   }
 
+  /* Boxes that hold file offsets this code does not rewrite: movie fragments,
+     segment and fragment indexes, sample auxiliary offsets (encrypted media),
+     and item locations. When any is present, nothing may move. */
+  var OFFSET_SENSITIVE = { moof: 1, sidx: 1, ssix: 1, mfra: 1, saio: 1, iloc: 1 };
+
+  function hasOffsetSensitiveBox(bytes, start, end, depth) {
+    if (depth > 12) return false;
+    var boxes = parseBoxes(bytes, start, end);
+    for (var i = 0; i < boxes.length; i++) {
+      var b = boxes[i];
+      if (OFFSET_SENSITIVE[b.type]) return true;
+      if (b.type === 'udta') continue;
+      if (MP4_CONTAINERS[b.type] && hasOffsetSensitiveBox(bytes, b.start + b.header, b.end, depth + 1)) return true;
+      if (b.type === 'meta' && hasOffsetSensitiveBox(bytes, metaChildStart(bytes, b), b.end, depth + 1)) return true;
+    }
+    return false;
+  }
+
+  function freeBox(size, header) {
+    var f = new Uint8Array(size);
+    if (header === 16) {
+      setU32be(f, 0, 1);
+      setU64be(f, 8, size);
+    } else {
+      setU32be(f, 0, size);
+    }
+    f[4] = 0x66; f[5] = 0x72; f[6] = 0x65; f[7] = 0x65;
+    return f;
+  }
+
   function stripIsoBmff(bytes, format) {
     var dropped = [];
+    var removed = 0;
+    /* Offset-sensitive files are scrubbed in place: each metadata box becomes a
+       free box of the same size, so every stored offset stays true. */
+    var inPlace = hasOffsetSensitiveBox(bytes, 0, bytes.length, 0);
     function shouldDrop(box) {
       if (box.type === 'udta' || box.type === 'XMP_' || box.type === 'xml ') return true;
       if (box.type === 'uuid' && (isXmpUuid(bytes, box) || indexOfBytes(bytes.subarray(box.start, box.end), fromLatin1('<?xpacket')) >= 0)) return true;
@@ -350,15 +444,24 @@
         var b = boxes[i];
         if (b.start > cursor) parts.push(bytes.subarray(cursor, b.start));
         if (shouldDrop(b)) {
-          dropped.push([b.start, b.end]);
+          removed++;
+          if (inPlace) parts.push(freeBox(b.end - b.start, b.header));
+          else dropped.push([b.start, b.end]);
         } else if (MP4_CONTAINERS[b.type] || b.type === 'meta') {
-          var childStart = b.start + b.header + (b.type === 'meta' ? 4 : 0);
+          var childStart = b.type === 'meta' ? metaChildStart(bytes, b) : b.start + b.header;
           var inner = rebuildRange(childStart, b.end);
-          var headRest = bytes.subarray(b.start + 8, childStart);
-          var bodyLen = headRest.length + inner.length;
-          var size = 8 + bodyLen;
-          var hdr = new Uint8Array(8);
-          setU32be(hdr, 0, size);
+          /* Keep the header the size it was (8 bytes, or 16 with a 64-bit size).
+             Shortening it would move everything after it without the offset map knowing. */
+          var headRest = bytes.subarray(b.start + b.header, childStart);
+          var size = b.header + headRest.length + inner.length;
+          var hdr = new Uint8Array(b.header);
+          if (b.header === 16) {
+            setU32be(hdr, 0, 1);
+            setU64be(hdr, 8, size);
+          } else {
+            if (size > 0xffffffff) throw new Error('A container box is too large to rewrite.');
+            setU32be(hdr, 0, size);
+          }
           hdr.set(bytes.subarray(b.start + 4, b.start + 8), 4);
           parts.push(hdr, headRest, inner);
         } else if (b.type === 'mvhd' || b.type === 'tkhd' || b.type === 'mdhd') {
@@ -389,8 +492,10 @@
         var b = boxes[i];
         if (b.type === 'stco' || b.type === 'co64') {
           var p = b.start + b.header;
-          var count = u32be(out, p + 4);
+          if (p + 8 > b.end) continue;
           var wide = b.type === 'co64';
+          /* The entry count is file data. Never walk past the end of the box. */
+          var count = Math.min(u32be(out, p + 4), Math.floor((b.end - (p + 8)) / (wide ? 8 : 4)));
           for (var n = 0; n < count; n++) {
             var at = p + 8 + n * (wide ? 8 : 4);
             var old = wide ? u64be(out, at) : u32be(out, at);
@@ -399,12 +504,13 @@
             else setU32be(out, at, neu);
           }
         } else if (MP4_CONTAINERS[b.type]) fix(b.start + b.header, b.end);
-        else if (b.type === 'meta') fix(b.start + b.header + 4, b.end);
+        else if (b.type === 'meta') fix(metaChildStart(out, b), b.end);
       }
     }
-    fix(0, out.length);
+    if (dropped.length) fix(0, out.length);
     var notes = [];
-    if (dropped.length) notes.push('Removed ' + dropped.length + ' metadata box(es) (user data, iTunes meta, and/or XMP uuid) and rewrote chunk offsets.');
+    if (removed && inPlace) notes.push('Overwrote ' + removed + ' metadata box(es) (user data, iTunes meta, and/or XMP uuid) with free space of the same size. This file stores offsets this tool does not rewrite (fragments, indexes, or encryption data), so nothing was moved.');
+    else if (removed) notes.push('Removed ' + removed + ' metadata box(es) (user data, iTunes meta, and/or XMP uuid) and rewrote chunk offsets.');
     else notes.push('No udta, iTunes meta, or XMP uuid boxes were present.');
     notes.push('Creation and modification times in mvhd, tkhd, and mdhd were set to zero.');
     notes.push('MP4, MOV, and M4A handling is best effort. Timed metadata stored as media samples can remain. This result is not a certification.');
@@ -458,7 +564,7 @@
     if (ver === 3) {
       /* extended header size includes itself on some writers; already handled loosely */
     }
-    while (pos + 10 <= end) {
+    while (pos + (ver === 2 ? 6 : 10) <= end) {
       var id, fsize, frameStart;
       if (ver === 2) {
         if (pos + 6 > end) break;
@@ -504,20 +610,49 @@
     return items;
   }
 
+  /* Tags the ID3 reader does not parse still have to show up in the scan.
+     Otherwise a tag the stripper failed to remove would pass the re-scan. */
+  function scanMp3(bytes) {
+    var items = scanId3(bytes);
+    if (indexOfBytes(bytes, fromLatin1('APETAGEX')) >= 0) items.push(item('APE tag', 'APE tag present', 'APE', 'APE tag'));
+    if (indexOfBytes(bytes, fromLatin1('LYRICSBEGIN')) >= 0) items.push(item('Lyrics3 tag', 'Lyrics3 tag present', 'Lyrics3', 'Lyrics3 tag'));
+    if (bytes.length >= 227 + 128 && ascii(bytes, bytes.length - 128 - 227, 4) === 'TAG+') items.push(item('Extended ID3v1 tag', 'Extended ID3v1 tag present', 'ID3', 'ID3v1'));
+    return items;
+  }
+
+  function id3v2Size(bytes, at, end) {
+    if (at + 10 > end || ascii(bytes, at, 3) !== 'ID3') return 0;
+    if (bytes[at + 3] === 0xff || bytes[at + 4] === 0xff) return 0;
+    if ((bytes[at + 6] | bytes[at + 7] | bytes[at + 8] | bytes[at + 9]) & 0x80) return 0;
+    return 10 + syncsafe(bytes, at + 6) + ((bytes[at + 5] & 0x10) ? 10 : 0);
+  }
+
   function stripMp3(bytes) {
     var start = 0;
     var end = bytes.length;
     var notes = [];
-    if (ascii(bytes, 0, 3) === 'ID3') {
-      var size = syncsafe(bytes, 6);
-      var footer = bytes[5] & 0x10;
-      start = 10 + size + (footer ? 10 : 0);
-      if (start > bytes.length) throw new Error('ID3 tag extends past the end of the file.');
-      notes.push('Removed ID3v2 tag (' + start + ' bytes).');
+    /* Files that were tagged twice carry more than one ID3v2 tag in a row. */
+    for (var guard = 0; guard < 16; guard++) {
+      var tagLen = id3v2Size(bytes, start, end);
+      if (!tagLen) break;
+      if (start + tagLen > end) throw new Error('ID3 tag extends past the end of the file.');
+      start += tagLen;
+      notes.push('Removed ID3v2 tag (' + tagLen + ' bytes).');
     }
     if (end - start >= 128 && ascii(bytes, end - 128, 3) === 'TAG') {
       end -= 128;
       notes.push('Removed ID3v1 tag.');
+      if (end - start >= 227 && ascii(bytes, end - 227, 4) === 'TAG+') {
+        end -= 227;
+        notes.push('Removed extended ID3v1 tag.');
+      }
+    }
+    if (end - start >= 15 && ascii(bytes, end - 9, 9) === 'LYRICS200') {
+      var lyr = parseInt(ascii(bytes, end - 15, 6), 10);
+      if (lyr > 0 && lyr + 15 < end - start && ascii(bytes, end - 15 - lyr, 11) === 'LYRICSBEGIN') {
+        end -= lyr + 15;
+        notes.push('Removed Lyrics3 tag.');
+      }
     }
     if (end - start >= 32 && ascii(bytes, end - 32, 8) === 'APETAGEX') {
       var tagSize = u32le(bytes, end - 32 + 12);
@@ -548,6 +683,8 @@
 
   /* ------------------------------------------------------------------ ZIP / Office / ODF */
 
+  var MAX_ZIP_TOTAL = 1024 * 1024 * 1024;
+
   async function readZip(bytes) {
     var eocd = -1;
     var min = Math.max(0, bytes.length - 65557);
@@ -555,30 +692,49 @@
       if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x05 && bytes[i + 3] === 0x06) { eocd = i; break; }
     }
     if (eocd < 0) throw new Error('ZIP end-of-central-directory was not found.');
-    if (u16le(bytes, eocd + 4) !== 0 || u32le(bytes, eocd + 16) === 0xffffffff) throw new Error('ZIP64 archives are not supported.');
     var entries = u16le(bytes, eocd + 10);
     var cdOff = u32le(bytes, eocd + 16);
+    if (u16le(bytes, eocd + 4) !== 0 || u16le(bytes, eocd + 6) !== 0 || entries === 0xffff || cdOff === 0xffffffff ||
+        (eocd >= 20 && ascii(bytes, eocd - 20, 4) === 'PK\x06\x07')) {
+      throw new Error('ZIP64 and multi-part archives are not supported.');
+    }
     var out = [];
     var p = cdOff;
+    var budget = MAX_ZIP_TOTAL;
     for (var n = 0; n < entries; n++) {
-      if (ascii(bytes, p, 4) !== 'PK\x01\x02') throw new Error('Bad ZIP central directory.');
+      if (p + 46 > bytes.length || ascii(bytes, p, 4) !== 'PK\x01\x02') throw new Error('Bad ZIP central directory.');
+      var flags = u16le(bytes, p + 8);
       var method = u16le(bytes, p + 10);
+      var wantCrc = u32le(bytes, p + 16);
       var compSize = u32le(bytes, p + 20);
+      var fullSize = u32le(bytes, p + 24);
       var nameLen = u16le(bytes, p + 28);
       var extraLen = u16le(bytes, p + 30);
       var commentLen = u16le(bytes, p + 32);
       var localOff = u32le(bytes, p + 42);
       var name = new TextDecoder('utf-8').decode(bytes.subarray(p + 46, p + 46 + nameLen));
       p += 46 + nameLen + extraLen + commentLen;
-      if (ascii(bytes, localOff, 4) !== 'PK\x03\x04') throw new Error('Bad ZIP local header for ' + name);
+      /* An encrypted entry would otherwise be copied as if it were plain data
+         and written back without its encryption flag. */
+      if (flags & 1) throw new Error('This ZIP has encrypted entries.');
+      if (compSize === 0xffffffff || fullSize === 0xffffffff || localOff === 0xffffffff) throw new Error('ZIP64 and multi-part archives are not supported.');
+      if (localOff + 30 > bytes.length || ascii(bytes, localOff, 4) !== 'PK\x03\x04') throw new Error('Bad ZIP local header for ' + name);
       var lname = u16le(bytes, localOff + 26);
       var lextra = u16le(bytes, localOff + 28);
       var dataStart = localOff + 30 + lname + lextra;
+      if (dataStart + compSize > bytes.length) throw new Error('ZIP entry ' + name + ' runs past the end of the file.');
+      /* Total expanded size is capped so a small archive cannot exhaust memory. */
+      if (fullSize > budget) throw new Error('This ZIP expands past the ' + Math.round(MAX_ZIP_TOTAL / 1048576) + ' MB safety limit.');
       var comp = bytes.subarray(dataStart, dataStart + compSize);
       var data;
       if (method === 0) data = comp.slice();
-      else if (method === 8) data = await inflate(comp, 'deflate-raw');
+      else if (method === 8) data = await inflate(comp, 'deflate-raw', Math.max(1, fullSize));
       else throw new Error('Unsupported ZIP compression method ' + method + ' in ' + name);
+      /* The declared size and checksum must match what was read. If they do not,
+         the archive is damaged or built to confuse, and rewriting it is a guess. */
+      if (data.length !== fullSize) throw new Error('ZIP entry ' + name + ' does not match its declared size.');
+      if (crc32(data) !== wantCrc) throw new Error('ZIP entry ' + name + ' failed its checksum.');
+      budget -= data.length;
       out.push({ name: name, data: data });
     }
     return out;
@@ -589,15 +745,29 @@
     var central = [];
     var offset = 0;
     var enc = new TextEncoder();
+    /* No ZIP64 here, so the classic limits are hard limits. Past them the
+       header fields wrap and the archive is silently corrupt. */
+    if (entries.length > 0xfffe) throw new Error('Too many files for one ZIP.');
+    /* 1980-01-01 00:00. A zero date is not a valid DOS date, and the real
+       time would be one more thing the output says about when it was made. */
+    var DOS_DATE = 0x0021;
     for (var i = 0; i < entries.length; i++) {
       var nameBytes = enc.encode(entries[i].name);
       var data = entries[i].data;
       var crc = crc32(data);
+      /* Bit 11 says the name is UTF-8. Without it, readers decode non-ASCII
+         names as CP437 and show the wrong characters. */
+      var gp = 0;
+      for (var nb = 0; nb < nameBytes.length; nb++) if (nameBytes[nb] > 127) { gp = 0x0800; break; }
+      if (nameBytes.length > 0xffff) throw new Error('A file name is too long for a ZIP.');
+      if (data.length > 0xfffffffe || offset + 30 + nameBytes.length + data.length > 0xfffffffe) throw new Error('The files are too large for one ZIP (4 GB limit).');
       var local = new Uint8Array(30 + nameBytes.length);
       var dv = new DataView(local.buffer);
       dv.setUint32(0, 0x04034b50, true);
       dv.setUint16(4, 20, true);
+      dv.setUint16(6, gp, true);
       dv.setUint16(8, 0, true);
+      dv.setUint16(12, DOS_DATE, true);
       dv.setUint32(14, crc, true);
       dv.setUint32(18, data.length, true);
       dv.setUint32(22, data.length, true);
@@ -609,6 +779,8 @@
       cv.setUint32(0, 0x02014b50, true);
       cv.setUint16(4, 20, true);
       cv.setUint16(6, 20, true);
+      cv.setUint16(8, gp, true);
+      cv.setUint16(14, DOS_DATE, true);
       cv.setUint32(16, crc, true);
       cv.setUint32(20, data.length, true);
       cv.setUint32(24, data.length, true);
@@ -635,19 +807,89 @@
     '<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" office:version="1.2"><office:meta/></office:document-meta>\n'
   );
 
+  /* Names and account identifiers that Office writes outside docProps:
+     comment and revision authors, initials, sign-in ids, the comment author
+     lists of PowerPoint and Excel, and the local folder path Excel records
+     (which usually contains the Windows user name). Values are blanked, not
+     removed, so every index and reference in the document still resolves. */
+  var OFFICE_SCRUB = [
+    { re: /\b((?:[A-Za-z0-9]+:)?(?:author|initials|userId|userName|lastModifiedBy))=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
+    { file: /(?:commentAuthors|(?:^|\/)authors)\.xml$/i, re: /\b(name)=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
+    { file: /persons\/[^\/]*\.xml$/i, re: /\b(displayName)=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
+    { file: /comments?\d*\.xml$/i, re: /(<(?:[A-Za-z0-9]+:)?author(?:\s[^<>]*)?>)[^<]*(<\/(?:[A-Za-z0-9]+:)?author>)/g, to: '$1$2' },
+    { re: /<mc:AlternateContent\b[^>]*>\s*<mc:Choice\b[^>]*>\s*<x15ac:absPath\b[^>]*\/>\s*<\/mc:Choice>\s*<\/mc:AlternateContent>/g, to: '' },
+    { re: /(<x15ac:absPath\b[^>]*\burl=)(?:"[^"]*"|'[^']*')/g, to: '$1""' }
+  ];
+  /* The same idea for OpenDocument: change-tracking and annotation authors
+     live in content.xml and styles.xml, not in meta.xml. */
+  var ODF_SCRUB = [
+    { re: /(<dc:creator>)[^<]*(<\/dc:creator>)/g, to: '$1$2' },
+    { re: /(<meta:creator-initials>)[^<]*(<\/meta:creator-initials>)/g, to: '$1$2' }
+  ];
+
+  /* What the scrub rules above target, as report rows. The scan and the
+     scrub have to agree, or the re-scan cannot vouch for the scrub. */
+  function officeIdentityItems(name, text, label, odf) {
+    var items = [];
+    var m;
+    function add(tag, value) {
+      value = String(value || '').trim();
+      if (value && items.length < 40) items.push(item(tag, value, label, name));
+    }
+    if (odf) {
+      if (/^(?:content|styles)\.xml$/i.test(name)) {
+        var oc = /<(?:dc:(creator)|meta:(creator-initials))>([^<]+)</g;
+        while ((m = oc.exec(text))) add(m[1] || m[2], m[3]);
+      }
+      return items;
+    }
+    var attr = /\b(?:[A-Za-z0-9]+:)?(author|initials|userId|userName|lastModifiedBy)=(?:"([^"]+)"|'([^']+)')/g;
+    while ((m = attr.exec(text))) add(m[1], m[2] != null ? m[2] : m[3]);
+    if (/(?:commentAuthors|(?:^|\/)authors)\.xml$/i.test(name)) {
+      var nm = /\bname=(?:"([^"]+)"|'([^']+)')/g;
+      while ((m = nm.exec(text))) add('author', m[1] != null ? m[1] : m[2]);
+    }
+    if (/persons\/[^\/]*\.xml$/i.test(name)) {
+      var dn = /\bdisplayName=(?:"([^"]+)"|'([^']+)')/g;
+      while ((m = dn.exec(text))) add('author', m[1] != null ? m[1] : m[2]);
+    }
+    if (/comments?\d*\.xml$/i.test(name)) {
+      var au = /<(?:[A-Za-z0-9]+:)?author(?:\s[^<>]*)?>([^<]+)</g;
+      while ((m = au.exec(text))) add('author', m[1]);
+    }
+    var ap = /<x15ac:absPath\b[^>]*\burl=(?:"([^"]+)"|'([^']+)')/g;
+    while ((m = ap.exec(text))) add('absPath', m[1] != null ? m[1] : m[2]);
+    return items;
+  }
+
+  function scrubOdfXml(data) {
+    var text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    var next = text;
+    for (var r = 0; r < ODF_SCRUB.length; r++) next = next.replace(ODF_SCRUB[r].re, ODF_SCRUB[r].to);
+    if (next === text) return null;
+    return new TextEncoder().encode(next);
+  }
+
   function scrubOfficeXml(name, data) {
     var text = new TextDecoder('utf-8', { fatal: false }).decode(data);
     var orig = text;
     var notes = [];
+    /* Only the three property parts are removed, so only their entries go.
+       Both spellings of an empty element are matched: a relationship left
+       pointing at a deleted part makes Office report the file as damaged. */
     if (name === '[Content_Types].xml') {
-      text = text.replace(/<Override\b[^>]*PartName="\/docProps\/[^"]*"[^>]*\/>/g, '');
+      text = text.replace(/<Override\b[^>]*PartName="\/docProps\/(?:core|app|custom)\.xml"[^>]*?(?:\/>|>\s*<\/Override>)/gi, '');
     }
     if (/\.rels$/i.test(name)) {
-      text = text.replace(/<Relationship\b[^>]*(?:docProps\/|core-properties|extended-properties|custom-properties)[^>]*\/>/g, '');
+      text = text.replace(/<Relationship\b[^>]*(?:docProps\/(?:core|app|custom)\.xml|core-properties|extended-properties|custom-properties)[^>]*?(?:\/>|>\s*<\/Relationship>)/gi, '');
     }
     if (/\.(xml|rels)$/i.test(name)) {
-      var next = text.replace(/\b((?:[A-Za-z0-9]+:)?author)="[^"]*"/g, '$1=""');
-      if (next !== text) notes.push('Cleared author attributes in ' + name);
+      var next = text;
+      for (var r = 0; r < OFFICE_SCRUB.length; r++) {
+        if (OFFICE_SCRUB[r].file && !OFFICE_SCRUB[r].file.test(name)) continue;
+        next = next.replace(OFFICE_SCRUB[r].re, OFFICE_SCRUB[r].to);
+      }
+      if (next !== text) notes.push('Cleared author and user identifiers in ' + name);
       text = next;
     }
     if (text === orig) return { changed: false, data: data, notes: notes };
@@ -675,9 +917,11 @@
     return fmt('zip', 'ZIP', 'unsupported', 'application/zip');
   }
 
-  async function scanOffice(bytes) {
+  async function scanOffice(bytes, depth) {
+    depth = depth || 0;
     var entries = await readZip(bytes);
     var kind = classifyZip(entries);
+    var odf = kind.format === 'odt' || kind.format === 'ods' || kind.format === 'odp';
     var items = [];
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
@@ -694,12 +938,18 @@
       }
       if (/\.(xml|rels)$/i.test(e.name)) {
         var xml = new TextDecoder('utf-8', { fatal: false }).decode(e.data);
-        var am = xml.match(/\bauthor="([^"]+)"/);
-        if (am && am[1]) items.push(item('author', am[1], kind.label, e.name));
+        items.push.apply(items, officeIdentityItems(e.name, xml, kind.label, odf));
       }
-      var nested = detectSync(e.data);
-      if (nested && nested.support === 'full' && nested.format !== 'zip') {
-        var sub = await scan(e.data);
+      /* Embedded parts are scanned with the full detector, so a workbook
+         behind a chart or a document inside a document is opened too. Before,
+         nested packages were skipped and could not hold back a clear result. */
+      var nested = await detect(e.data);
+      if (nested.support === 'full' || nested.support === 'best-effort') {
+        if (depth >= MAX_NESTING) {
+          items.push(item('Embedded file', 'Nested too deeply to scan', kind.label, e.name));
+          continue;
+        }
+        var sub = await scan(e.data, depth + 1);
         for (var s = 0; s < sub.items.length; s++) {
           sub.items[s].source = e.name + ' → ' + sub.items[s].source;
           items.push(sub.items[s]);
@@ -714,6 +964,16 @@
     var notes = [];
     var kept = [];
     var odf = kind.format === 'odt' || kind.format === 'ods' || kind.format === 'odp';
+    var blocksClear = false;
+    if (odf) {
+      for (var m = 0; m < entries.length; m++) {
+        /* An encrypted package lists every part as encrypted in its manifest.
+           Swapping in a plain meta.xml would leave a file that cannot be opened. */
+        if (entries[m].name === 'META-INF/manifest.xml' && indexOfBytes(entries[m].data, fromLatin1('encryption-data')) >= 0) {
+          throw new Error('Password-protected OpenDocument files are not supported.');
+        }
+      }
+    }
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
       var lower = e.name.toLowerCase();
@@ -725,19 +985,32 @@
       if (odf && lower === 'meta.xml') {
         data = EMPTY_ODF_META;
         notes.push('Replaced meta.xml with an empty office:meta element.');
-      } else if (/\.(xml|rels)$/i.test(e.name)) {
+      } else if (odf && (lower === 'content.xml' || lower === 'styles.xml')) {
+        var odfScrub = scrubOdfXml(data);
+        if (odfScrub) {
+          data = odfScrub;
+          notes.push('Cleared change-tracking and comment author names in ' + e.name);
+        }
+      } else if (!odf && /\.(xml|rels)$/i.test(e.name)) {
         var scrub = scrubOfficeXml(e.name, data);
         if (scrub.changed) {
           data = scrub.data;
           notes.push.apply(notes, scrub.notes);
         }
       }
-      var nested = detectSync(data);
-      if (nested && (nested.support === 'full' || nested.support === 'best-effort') && nested.format !== kind.format && !/^zip|docx|xlsx|pptx|odt|ods|odp$/.test(nested.format)) {
+      /* Embedded pictures, media, PDFs, and whole embedded documents go through
+         the same strippers. A part that could not be stripped, or that only has
+         best-effort support, keeps the package from being reported as clear. */
+      var nested = await detect(data);
+      if (nested.support === 'full' || nested.support === 'best-effort') {
         var stripped = await stripLossless(data, depth + 1);
         if (stripped.ok) {
           data = stripped.bytes;
           notes.push('Stripped embedded ' + e.name + ' (' + nested.label + ')');
+          if (stripped.support !== 'full' || stripped.blocksClear) blocksClear = true;
+        } else {
+          notes.push('Left embedded ' + e.name + ' (' + nested.label + ') as it was: ' + stripped.reason);
+          blocksClear = true;
         }
       }
       kept.push({ name: e.name, data: data });
@@ -750,7 +1023,7 @@
       });
     }
     if (!notes.length) notes.push('No document properties were found.');
-    return okResult(kind.format, 'full', writeZip(kept), notes, false);
+    return okResult(kind.format, 'full', writeZip(kept), notes, blocksClear);
   }
 
   /* ------------------------------------------------------------------ PDF */
@@ -855,6 +1128,9 @@
     }
     var ks = i;
     while (i < bytes.length && !isDelim(bytes[i])) i++;
+    /* A stray delimiter (or the end of the data) yields no token. Returning an
+       empty one made the array and dictionary loops spin forever on bad input. */
+    if (i === ks) throw new Error('Unexpected character in PDF object at offset ' + ks + '.');
     return { value: { type: 'keyword', word: latin1(bytes.subarray(ks, i)), raw: bytes.subarray(ks, i) }, end: i };
   }
 
@@ -914,6 +1190,19 @@
     throw new Error('Unsupported PDF predictor ' + predictor);
   }
 
+  /* Checks that a stream of the stated length really ends in "endstream" and
+     returns the offset after it. A wrong /Length is common in damaged files.
+     Trusting it would copy a stream that is too short or too long. */
+  function streamEnd(bytes, streamStart, length, id) {
+    if (!(length >= 0) || length !== Math.floor(length) || streamStart + length > bytes.length) {
+      throw new Error('PDF stream ' + id + ' has a length that does not fit the file.');
+    }
+    var i = streamStart + length;
+    while (i < bytes.length && isWs(bytes[i])) i++;
+    if (!matchKw(bytes, i, 'endstream')) throw new Error('PDF stream ' + id + ' does not end where its length says.');
+    return skipWs(bytes, i + 9);
+  }
+
   function readPdfObject(bytes, offset) {
     var i = skipWs(bytes, offset);
     var start = i;
@@ -937,15 +1226,15 @@
       else if (lenVal && lenVal.type === 'ref') lengthIndirect = true;
       else throw new Error('Stream is missing a length.');
       if (lengthDirect != null) {
+        i = streamEnd(bytes, streamStart, lengthDirect, id.num);
         stream = bytes.slice(streamStart, streamStart + lengthDirect);
-        i = streamStart + lengthDirect;
-        i = skipWs(bytes, i);
-        if (matchKw(bytes, i, 'endstream')) i += 9;
-        i = skipWs(bytes, i);
       }
     }
     if (!lengthIndirect) {
-      if (matchKw(bytes, i, 'endobj')) i += 6;
+      /* The object is copied out byte for byte, so its end has to be known.
+         Guessing here used to produce a cut-off object in the output. */
+      if (!matchKw(bytes, i, 'endobj')) throw new Error('PDF object ' + id.num + ' has no endobj where one is expected.');
+      i += 6;
       return {
         id: id.num, gen: gen.num, start: start, end: i, value: parsed.value,
         stream: stream, raw: bytes.slice(start, i), lengthIndirect: false, streamStart: streamStart
@@ -963,11 +1252,10 @@
     var nobj = objects.get(lenVal.id);
     if (!nobj || nobj.value.type !== 'number') throw new Error('Indirect stream length could not be resolved.');
     var length = nobj.value.num;
+    var i = streamEnd(bytes, obj.streamStart, length, obj.id);
     obj.stream = bytes.slice(obj.streamStart, obj.streamStart + length);
-    var i = skipWs(bytes, obj.streamStart + length);
-    if (matchKw(bytes, i, 'endstream')) i += 9;
-    i = skipWs(bytes, i);
-    if (matchKw(bytes, i, 'endobj')) i += 6;
+    if (!matchKw(bytes, i, 'endobj')) throw new Error('PDF object ' + obj.id + ' has no endobj where one is expected.');
+    i += 6;
     obj.end = i;
     obj.raw = bytes.slice(obj.start, i);
     obj.lengthIndirect = false;
@@ -975,11 +1263,13 @@
 
   async function decodeStream(obj) {
     var data = obj.stream;
-    var filter = obj.value.get && obj.value.get('Filter');
-    var name = filter && filter.type === 'name' ? filter.name : '';
-    if (name === 'FlateDecode') data = await inflate(data, 'deflate');
-    else if (name) throw new Error('Unsupported PDF filter ' + name);
-    var parms = obj.value.get && obj.value.get('DecodeParms');
+    /* /Filter may be a name or an array holding one name. Both mean the same. */
+    var filters = filtersOf(obj.value);
+    if (filters.length > 1 || (filters.length === 1 && filters[0] !== 'FlateDecode' && filters[0] !== 'Fl')) {
+      throw new Error('Unsupported PDF filter ' + filters.join(' + '));
+    }
+    if (filters.length === 1) data = await inflate(data, 'deflate');
+    var parms = firstParms(obj.value);
     if (parms && parms.type === 'dict') {
       var predictor = parms.get('Predictor');
       var columns = parms.get('Columns');
@@ -990,9 +1280,20 @@
     return data;
   }
 
+  function firstParms(dict) {
+    var parms = dict && dict.get ? dict.get('DecodeParms') : null;
+    if (parms && parms.type === 'array') parms = parms.items[0] || null;
+    return parms;
+  }
+
   function parseObjStm(data, dict) {
-    var N = dict.get('N').num;
-    var First = dict.get('First').num;
+    var nv = dict.get('N');
+    var fv = dict.get('First');
+    if (!nv || nv.type !== 'number' || !fv || fv.type !== 'number') throw new Error('Object stream is missing /N or /First.');
+    var N = nv.num;
+    var First = fv.num;
+    /* Each object needs at least a few bytes. A larger count is not real. */
+    if (!(N >= 0) || N > data.length || !(First >= 0) || First > data.length) throw new Error('Object stream header does not fit its data.');
     var pos = 0;
     function readIntAt(p) {
       p = skipWs(data, p);
@@ -1045,12 +1346,18 @@
     var W = dict.get('W');
     if (!W || W.type !== 'array') throw new Error('XRef stream is missing /W.');
     var w = W.items.map(function (n) { return n.num; });
+    if (w.length < 3 || !w.every(function (n) { return n >= 0 && n <= 8 && n === Math.floor(n); })) throw new Error('XRef stream has an unusable /W.');
+    var rowSize = w[0] + w[1] + w[2];
+    if (!rowSize) throw new Error('XRef stream has an unusable /W.');
     var data = obj.stream;
-    var filter = dict.get('Filter');
-    if (filter && filter.type === 'name' && filter.name === 'FlateDecode') data = await inflate(data, 'deflate');
-    var parms = dict.get('DecodeParms');
+    var filters = filtersOf(dict);
+    if (filters.length > 1 || (filters.length === 1 && filters[0] !== 'FlateDecode' && filters[0] !== 'Fl')) {
+      throw new Error('Unsupported filter on the PDF cross-reference stream.');
+    }
+    if (filters.length === 1) data = await inflate(data, 'deflate');
+    var parms = firstParms(dict);
     var predictor = 1;
-    var columns = w[0] + w[1] + w[2];
+    var columns = rowSize;
     if (parms && parms.type === 'dict') {
       if (parms.get('Predictor')) predictor = parms.get('Predictor').num;
       if (parms.get('Columns')) columns = parms.get('Columns').num;
@@ -1059,8 +1366,14 @@
     var index = dict.get('Index');
     var sections = [];
     if (index && index.type === 'array') {
-      for (var s = 0; s < index.items.length; s += 2) sections.push([index.items[s].num, index.items[s + 1].num]);
-    } else sections.push([0, dict.get('Size').num]);
+      for (var s = 0; s + 1 < index.items.length; s += 2) sections.push([index.items[s].num, index.items[s + 1].num]);
+    } else {
+      var sizeVal = dict.get('Size');
+      if (!sizeVal || sizeVal.type !== 'number') throw new Error('XRef stream is missing /Size.');
+      sections.push([0, sizeVal.num]);
+    }
+    /* The section counts are file data. The decoded table is the real limit. */
+    var rowsLeft = Math.floor(data.length / rowSize);
     var entries = [];
     var p = 0;
     function field(width) {
@@ -1071,6 +1384,7 @@
     for (var si = 0; si < sections.length; si++) {
       var id = sections[si][0];
       for (var n = 0; n < sections[si][1]; n++, id++) {
+        if (rowsLeft-- <= 0) break;
         var type = w[0] ? field(w[0]) : 1;
         var f2 = field(w[1]);
         var f3 = field(w[2]);
@@ -1088,46 +1402,62 @@
     var pos = readPdfNumber(bytes, skipWs(bytes, sx + 9)).num;
     var map = new Map();
     var trailer = null;
-    async function walk(at, depth) {
-      if (depth > 20 || at < 0 || at >= bytes.length) return;
+    var visited = new Set();
+    /* Every revision of the file adds one cross-reference section. All of them
+       are needed: stopping early (the old limit was 20) left objects out of the
+       rewrite and still reported success. */
+    var MAX_SECTIONS = 4096;
+    async function walk(at) {
+      if (!(at >= 0) || at >= bytes.length) throw new Error('A PDF cross-reference offset points outside the file.');
+      if (visited.has(at)) return;
+      if (visited.size >= MAX_SECTIONS) throw new Error('PDF has too many cross-reference sections.');
+      visited.add(at);
       var i = skipWs(bytes, at);
       if (matchKw(bytes, i, 'xref')) {
         var classic = parseClassicXref(bytes, i);
+        if (!classic.trailer || classic.trailer.type !== 'dict') throw new Error('PDF trailer is not a dictionary.');
         if (!trailer) trailer = classic.trailer;
         for (var c = 0; c < classic.entries.length; c++) if (!map.has(classic.entries[c].id)) map.set(classic.entries[c].id, classic.entries[c]);
-        var prev = classic.trailer.get && classic.trailer.get('Prev');
-        if (prev && prev.type === 'number') await walk(prev.num, depth + 1);
+        /* Hybrid-reference files keep part of the table in a cross-reference
+           stream named by /XRefStm. Objects listed only there were being lost. */
+        var hybrid = classic.trailer.get('XRefStm');
+        if (hybrid && hybrid.type === 'number') await walk(hybrid.num);
+        var prev = classic.trailer.get('Prev');
+        if (prev && prev.type === 'number') await walk(prev.num);
         return;
       }
       var obj = readPdfObject(bytes, i);
-      if (obj.lengthIndirect) {
-        var len = obj.value.get('Length');
-        if (len && len.type === 'number') { /* already handled */ }
-      }
-      if (!obj.stream && obj.value.type === 'dict' && obj.value.get('Type') && obj.value.get('Type').name === 'XRef' && obj.lengthIndirect) {
-        throw new Error('XRef stream length is indirect.');
-      }
-      if (obj.value.type === 'dict' && obj.stream) {
-        if (!trailer) trailer = obj.value;
-        var ents = await parseXrefStreamEntries(obj);
-        for (var e = 0; e < ents.length; e++) if (!map.has(ents[e].id)) map.set(ents[e].id, ents[e]);
-        var prev2 = obj.value.get('Prev');
-        if (prev2 && prev2.type === 'number') await walk(prev2.num, depth + 1);
-        map.set(obj.id, { id: obj.id, type: 0, gen: obj.gen, xrefStream: true });
-      }
+      if (obj.lengthIndirect) throw new Error('XRef stream length is indirect.');
+      if (obj.value.type !== 'dict' || !obj.stream) throw new Error('PDF cross-reference section was not found where startxref points.');
+      if (!trailer) trailer = obj.value;
+      var ents = await parseXrefStreamEntries(obj);
+      for (var e = 0; e < ents.length; e++) if (!map.has(ents[e].id)) map.set(ents[e].id, ents[e]);
+      var prev2 = obj.value.get('Prev');
+      if (prev2 && prev2.type === 'number') await walk(prev2.num);
+      map.set(obj.id, { id: obj.id, type: 0, gen: obj.gen, xrefStream: true });
     }
-    await walk(pos, 0);
+    await walk(pos);
     if (!trailer) throw new Error('PDF trailer was not found.');
     if (trailer.get('Encrypt')) throw new Error('Encrypted PDFs are not modified.');
     var objects = new Map();
     map.forEach(function (entry) {
       if (entry.type === 1 && !entry.xrefStream) {
         var obj = readPdfObject(bytes, entry.offset);
+        /* The object is written back under the number the table gives it, so
+           the two have to agree. A stale table would otherwise renumber objects. */
+        if (obj.id !== entry.id) throw new Error('PDF cross-reference table points object ' + entry.id + ' at object ' + obj.id + '.');
         obj.gen = entry.gen;
         objects.set(entry.id, obj);
       }
     });
-    objects.forEach(function (obj) { if (obj.lengthIndirect) finishIndirect(bytes, obj, objects); });
+    /* A stream length can itself live in an object stream. Resolve what can be
+       resolved now and the rest after the object streams are unpacked. */
+    objects.forEach(function (obj) {
+      if (!obj.lengthIndirect) return;
+      var ref = obj.value.get('Length');
+      var target = objects.get(ref.id);
+      if (target && !target.lengthIndirect) finishIndirect(bytes, obj, objects);
+    });
     var groups = new Map();
     map.forEach(function (entry) {
       if (entry.type === 2) {
@@ -1138,6 +1468,7 @@
     for (var pair of groups) {
       var stm = objects.get(pair[0]);
       if (!stm) throw new Error('Object stream ' + pair[0] + ' is missing.');
+      if (stm.lengthIndirect || !stm.stream) throw new Error('Object stream ' + pair[0] + ' could not be read.');
       var data = await decodeStream(stm);
       var inner = parseObjStm(data, stm.value);
       var byIndex = {};
@@ -1146,9 +1477,11 @@
       for (var li = 0; li < list.length; li++) {
         var got = byIndex[list[li].index];
         if (!got) throw new Error('Object stream index missing.');
+        if (got.id !== list[li].id) throw new Error('Object stream ' + pair[0] + ' does not hold object ' + list[li].id + ' at the listed position.');
         objects.set(list[li].id, { id: got.id, gen: 0, value: got.value, stream: null, raw: null, fromObjStm: true });
       }
     }
+    objects.forEach(function (obj) { if (obj.lengthIndirect) finishIndirect(bytes, obj, objects); });
     return { trailer: trailer, objects: objects, map: map };
   }
 
@@ -1187,6 +1520,7 @@
     var notes = [];
     var skip = {};
     var replacement = {};
+    var imageTrouble = 0;
     if (infoRef && infoRef.type === 'ref') {
       replacement[infoRef.id] = fromLatin1(infoRef.id + ' ' + (objects.get(infoRef.id) ? objects.get(infoRef.id).gen : 0) + ' obj\n<<>>\nendobj\n');
       notes.push('Cleared the document information dictionary.');
@@ -1206,7 +1540,15 @@
       var subtype = obj.value.get('Subtype');
       var filters = filtersOf(obj.value);
       if (obj.stream && subtype && subtype.type === 'name' && subtype.name === 'Image' && filters.length === 1 && filters[0] === 'DCTDecode' && obj.stream[0] === 0xff && obj.stream[1] === 0xd8) {
-        var stripped = stripJpeg(obj.stream);
+        var stripped;
+        try {
+          stripped = stripJpeg(obj.stream);
+        } catch (err) {
+          /* One picture the JPEG walker cannot follow should not stop the whole
+             document. It is left as it was, and the result is not called clear. */
+          imageTrouble++;
+          return;
+        }
         if (stripped.bytes.length !== obj.stream.length || indexOfBytes(obj.stream, [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]) >= 0) {
           var dictText = emitDict(obj.value, null, { Length: String(stripped.bytes.length) });
           var head = fromLatin1(obj.id + ' ' + obj.gen + ' obj\n' + dictText + '\nstream\n');
@@ -1221,6 +1563,10 @@
     var chunks = [pdfHeader(bytes)];
     if (chunks[0].length && chunks[0][chunks[0].length - 1] !== 10) chunks.push(fromLatin1('\n'));
     var offsets = {};
+    /* Running total. Re-adding every chunk for every object was quadratic and
+       stalled on documents with tens of thousands of objects. */
+    var written = 0;
+    for (var w0 = 0; w0 < chunks.length; w0++) written += chunks[w0].length;
     for (var i = 0; i < ids.length; i++) {
       var id = ids[i];
       var obj = objects.get(id);
@@ -1229,31 +1575,33 @@
       else if (obj.raw) body = concat([obj.raw, fromLatin1('\n')]);
       else if (obj.value && obj.value.raw) body = fromLatin1(obj.id + ' ' + (obj.gen || 0) + ' obj\n' + latin1(obj.value.raw) + '\nendobj\n');
       else throw new Error('Cannot serialize PDF object ' + id);
-      var at = 0;
-      for (var c = 0; c < chunks.length; c++) at += chunks[c].length;
-      offsets[id] = { off: at, gen: obj.gen || 0 };
+      offsets[id] = { off: written, gen: obj.gen || 0 };
+      written += body.length;
       chunks.push(body);
     }
     var maxId = 0;
     objects.forEach(function (_, id) { if (id > maxId) maxId = id; });
     ids.forEach(function (id) { if (id > maxId) maxId = id; });
-    var xrefAt = 0;
-    for (var c2 = 0; c2 < chunks.length; c2++) xrefAt += chunks[c2].length;
+    var xrefAt = written;
+    if (xrefAt > 9999999999) throw new Error('PDF is too large for a classic cross-reference table.');
     function pad(n, w) { var s = String(n); while (s.length < w) s = '0' + s; return s; }
-    var xref = 'xref\n0 ' + (maxId + 1) + '\n';
-    xref += pad(0, 10) + ' ' + pad(65535, 5) + ' f \n';
+    var rows = ['xref\n0 ' + (maxId + 1) + '\n', pad(0, 10) + ' ' + pad(65535, 5) + ' f \n'];
     for (var idn = 1; idn <= maxId; idn++) {
-      if (offsets[idn]) xref += pad(offsets[idn].off, 10) + ' ' + pad(offsets[idn].gen, 5) + ' n \n';
-      else xref += pad(0, 10) + ' ' + pad(0, 5) + ' f \n';
+      if (offsets[idn]) rows.push(pad(offsets[idn].off, 10) + ' ' + pad(offsets[idn].gen, 5) + ' n \n');
+      else rows.push(pad(0, 10) + ' ' + pad(0, 5) + ' f \n');
     }
-    var idObj = trailer.get('ID');
+    var xref = rows.join('');
     var trailerText = 'trailer\n<< /Size ' + (maxId + 1) + ' /Root ' + latin1(rootRef.raw);
     if (infoRef && infoRef.type === 'ref' && !skip[infoRef.id]) trailerText += ' /Info ' + latin1(infoRef.raw);
-    if (idObj && idObj.raw) trailerText += ' /ID ' + latin1(idObj.raw);
+    /* The trailer /ID is left out. Its first half is a permanent identifier
+       given to the document when it was created, so it ties the stripped copy
+       to the original. Only encrypted files need it, and those are refused. */
+    if (trailer.get('ID')) notes.push('Left out the trailer /ID. It is a fixed identifier that links copies of the same document.');
     trailerText += ' >>\nstartxref\n' + xrefAt + '\n%%EOF\n';
     chunks.push(fromLatin1(xref + trailerText));
     notes.push('Flattened the cross-reference table so earlier incremental copies of metadata are not kept.');
-    return okResult('pdf', 'full', concat(chunks), notes, false);
+    if (imageTrouble) notes.push(imageTrouble + ' embedded JPEG image(s) could not be parsed and were left as they were. Metadata inside them, if any, is still there.');
+    return okResult('pdf', 'full', concat(chunks), notes, imageTrouble > 0);
   }
 
   /* ------------------------------------------------------------------ detect / scan / strip */
@@ -1296,14 +1644,22 @@
       var entries = await readZip(bytes);
       return classifyZip(entries);
     } catch (e) {
-      return fmt('zip', 'ZIP', 'unsupported', 'application/zip');
+      /* Keep the reason. "Not an Office package" is the wrong thing to tell
+         someone whose document is encrypted, damaged, or over the size limit. */
+      var bad = fmt('zip', 'ZIP', 'unsupported', 'application/zip');
+      bad.reason = e && e.message ? e.message : String(e);
+      return bad;
     }
   }
 
-  async function scan(bytes) {
+  var MAX_NESTING = 4;
+
+  async function scan(bytes, depth) {
+    depth = depth || 0;
     var detected = await detect(bytes);
     var items = [];
     var notes = [];
+    if (detected.reason) notes.push('This ZIP could not be read: ' + detected.reason);
     try {
       if (detected.format === 'jpeg') items = scanJpeg(bytes);
       else if (detected.format === 'png') items = await scanPngFull(bytes);
@@ -1312,12 +1668,17 @@
       else if (detected.format === 'tiff') items = parseTiffMetadata(bytes, 0, 'TIFF');
       else if (detected.format === 'heic') items = scanHeic(bytes);
       else if (detected.format === 'pdf') items = items.concat(await scanPdfLight(bytes));
-      else if (detected.format === 'mp3') items = scanId3(bytes);
+      else if (detected.format === 'mp3') items = scanMp3(bytes);
       else if (detected.format === 'mp4' || detected.format === 'mov' || detected.format === 'm4a') items = scanQt(bytes);
-      else if (detected.format === 'docx' || detected.format === 'xlsx' || detected.format === 'pptx' || detected.format === 'odt' || detected.format === 'ods' || detected.format === 'odp') items = await scanOffice(bytes);
+      else if (detected.format === 'docx' || detected.format === 'xlsx' || detected.format === 'pptx' || detected.format === 'odt' || detected.format === 'ods' || detected.format === 'odp') items = await scanOffice(bytes, depth);
       else notes.push(detected.format === 'bigtiff' ? 'BigTIFF is recognized and left untouched.' : 'This file type is not supported.');
     } catch (e) {
       notes.push('Scan failed: ' + e.message);
+      /* A scan that broke off has not looked at the whole file. Say so as a
+         finding, so the re-scan cannot come back empty and read as "clear". */
+      if (detected.support !== 'unsupported') {
+        items.push(item('Scan incomplete', 'The scan stopped early (' + e.message + '). Metadata may be present that is not listed.', 'Scan', 'scanner'));
+      }
     }
     items = mergeSafety(items, bytes);
     return { detected: detected, items: items, notes: notes };
@@ -1356,24 +1717,46 @@
   function pdfString(raw) {
     var s = latin1(raw);
     if (s.charAt(0) === '(' && s.charAt(s.length - 1) === ')') s = s.slice(1, -1);
-    return s.replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t').replace(/\\\(/g, '(').replace(/\\\)/g, ')').replace(/\\\\/g, '\\');
+    /* One pass, so an escaped backslash is not read twice. Octal escapes included. */
+    s = s.replace(/\\([0-7]{1,3}|\r\n|[\s\S])/g, function (_, c) {
+      if (c === 'n') return '\n';
+      if (c === 'r') return '\r';
+      if (c === 't') return '\t';
+      if (c === 'b') return '\b';
+      if (c === 'f') return '\f';
+      if (c === '\n' || c === '\r' || c === '\r\n') return '';
+      if (/^[0-7]+$/.test(c)) return String.fromCharCode(parseInt(c, 8) & 255);
+      return c;
+    });
+    return pdfTextDecode(s);
   }
   function pdfHex(raw) {
     var s = latin1(raw).replace(/[<>\s]/g, '');
+    if (s.length % 2) s += '0';
     var out = '';
     for (var i = 0; i + 1 < s.length; i += 2) out += String.fromCharCode(parseInt(s.substr(i, 2), 16));
-    return out;
+    return pdfTextDecode(out);
+  }
+  /* PDF text strings are UTF-16BE or UTF-8 when they start with a byte-order
+     mark. Shown raw, a UTF-16 title reads as noise. */
+  function pdfTextDecode(s) {
+    try {
+      if (s.charCodeAt(0) === 0xfe && s.charCodeAt(1) === 0xff) return new TextDecoder('utf-16be').decode(fromLatin1(s.slice(2)));
+      if (s.charCodeAt(0) === 0xef && s.charCodeAt(1) === 0xbb && s.charCodeAt(2) === 0xbf) return new TextDecoder('utf-8').decode(fromLatin1(s.slice(3)));
+    } catch (e) { /* fall back to the raw bytes */ }
+    return s;
   }
 
   async function stripLossless(bytes, depth) {
     depth = depth || 0;
-    if (depth > 4) return failResult('unknown', 'Nested container is too deep.');
+    if (depth > MAX_NESTING) return failResult('unknown', 'Nested container is too deep.');
     var detected;
     try { detected = await detect(bytes); }
     catch (e) { return failResult('unknown', e.message); }
     if (detected.support === 'unsupported') {
       var why = detected.format === 'bigtiff' ? 'BigTIFF is not supported. The file was not modified.'
         : detected.format === 'avif' ? 'AVIF is not a v1 format. The file was not modified.'
+        : detected.format === 'zip' && detected.reason ? 'This ZIP could not be read (' + detected.reason + '). It was not modified.'
         : detected.format === 'zip' ? 'This ZIP is not an Office or ODF package. It was not modified.'
         : 'Unsupported file type. The file was not modified.';
       return failResult(detected.format, why);
@@ -1407,7 +1790,10 @@
         return await stripOffice(bytes, detected, depth);
       }
     } catch (e) {
-      return failResult(detected.format, e.message + ' The file was not modified.');
+      /* Some messages already end with this sentence. Say it once. */
+      var msg = String(e && e.message ? e.message : e).replace(/\s*(?:The file|It) was not modified\.\s*$/, '');
+      if (!/[.!?]$/.test(msg)) msg += '.';
+      return failResult(detected.format, msg + ' The file was not modified.');
     }
     return failResult(detected.format, 'No stripper is available. The file was not modified.');
   }
