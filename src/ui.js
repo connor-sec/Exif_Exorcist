@@ -91,46 +91,89 @@
     });
   }
 
+  /* What to show for a file whose scan threw. It is never an empty result:
+     an empty result reads as "nothing found". */
+  function scanFailure(err) {
+    var reason = err && err.message ? err.message : String(err);
+    return {
+      detected: { format: 'unknown', label: 'Unreadable', support: 'unsupported', mime: '' },
+      items: [{ tag: 'Scan failed', value: 'This file could not be scanned (' + reason + ').', group: 'Scan', source: 'scanner', sensitive: null, structural: false }],
+      notes: ['Scan failed: ' + reason]
+    };
+  }
+
+  var busy = false;
+
   async function scanNew() {
-    for (var i = 0; i < files.length; i++) {
-      if (files[i].before) continue;
-      files[i].before = await EE.scan(files[i].bytes);
-      files[i].detected = files[i].before.detected;
+    /* Work from a snapshot. The list can change while a scan is awaited
+       (another drop, or "Remove from list"), and indexing the live array
+       then skips files or lands on an empty slot. */
+    var batch = files.slice();
+    for (var i = 0; i < batch.length; i++) {
+      if (batch[i].before || batch[i].scanning) continue;
+      batch[i].scanning = true;
+      try {
+        batch[i].before = await EE.scan(batch[i].bytes);
+      } catch (err) {
+        batch[i].before = scanFailure(err);
+      }
+      batch[i].scanning = false;
+      batch[i].detected = batch[i].before.detected;
     }
     render();
     var gps = 0;
     var serial = 0;
     files.forEach(function (f) {
+      if (!f.before) return;
       (f.before.items || []).forEach(function (it) {
         if (it.sensitive === 'gps') gps++;
         if (it.sensitive === 'serial') serial++;
       });
     });
     setStatus(files.length + ' file' + (files.length === 1 ? '' : 's') + ' scanned. ' + gps + ' GPS field' + (gps === 1 ? '' : 's') + ', ' + serial + ' serial field' + (serial === 1 ? '' : 's') + '.');
-    stripBtn.disabled = files.length === 0;
-    stripBtn.focus();
+    stripBtn.disabled = busy || files.length === 0;
+    if (!busy) stripBtn.focus();
   }
 
   stripBtn.addEventListener('click', async function () {
+    if (busy) return;
+    busy = true;
     stripBtn.disabled = true;
     zipBtn.disabled = true;
     var useCanvas = mode() === 'canvas';
-    for (var i = 0; i < files.length; i++) {
-      setStatus('Stripping ' + (i + 1) + ' of ' + files.length + '.');
-      files[i].result = await exorcise(files[i], useCanvas);
+    /* A snapshot again, and every exit re-enables the button. Before, a file
+       dropped in mid-run had no result yet, the summary loop threw on it, and
+       the Strip button stayed disabled until the page was reloaded. */
+    var batch = files.filter(function (f) { return f.before; });
+    try {
+      for (var i = 0; i < batch.length; i++) {
+        setStatus('Stripping ' + (i + 1) + ' of ' + batch.length + '.');
+        try {
+          batch[i].result = await exorcise(batch[i], useCanvas);
+        } catch (err) {
+          var reason = 'Stripping stopped with an error (' + (err && err.message ? err.message : String(err)) + '). The original file was not modified.';
+          var failed = { ok: false, format: 'unknown', support: 'unsupported', bytes: null, notes: [], blocksClear: true, reason: reason };
+          batch[i].result = { stripped: failed, after: batch[i].before, verdict: EE.judge(failed, batch[i].before), downloadName: null, bytes: null };
+        }
+      }
+      render();
+      var counts = { clear: 0, residual: 0, unverified: 0, failed: 0 };
+      files.forEach(function (f) {
+        if (!f.result) return;
+        counts[f.result.verdict.level] = (counts[f.result.verdict.level] || 0) + 1;
+      });
+      var line = 'Finished. ' +
+        counts.clear + ' with no metadata detected, ' +
+        counts.unverified + ' not certified, ' +
+        counts.residual + ' still carrying metadata, ' +
+        counts.failed + ' not modified.';
+      setStatus(line);
+      summary.textContent = line;
+    } finally {
+      busy = false;
+      stripBtn.disabled = files.length === 0;
+      zipBtn.disabled = !files.some(function (f) { return f.result && f.result.bytes; });
     }
-    render();
-    var counts = { clear: 0, residual: 0, unverified: 0, failed: 0 };
-    files.forEach(function (f) { counts[f.result.verdict.level] = (counts[f.result.verdict.level] || 0) + 1; });
-    var line = 'Finished. ' +
-      counts.clear + ' with no metadata detected, ' +
-      counts.unverified + ' not certified, ' +
-      counts.residual + ' still carrying metadata, ' +
-      counts.failed + ' not modified.';
-    setStatus(line);
-    summary.textContent = line;
-    stripBtn.disabled = false;
-    zipBtn.disabled = !files.some(function (f) { return f.result && f.result.bytes; });
     var first = document.querySelector('.verdict');
     if (first) first.focus();
   });
@@ -206,7 +249,9 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(function () { URL.revokeObjectURL(url); }, 1500);
+    /* Large files are still being written to disk after 1.5 seconds. Revoking
+       the URL that early cancels the save in some browsers. */
+    setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
   }
 
   zipBtn.addEventListener('click', function () {
@@ -226,13 +271,17 @@
       entries.push({ name: name, data: f.result.bytes });
     });
     if (!entries.length) return;
-    downloadBytes('exif-exorcist.zip', EE.writeZip(entries), 'application/zip');
+    try {
+      downloadBytes('exif-exorcist.zip', EE.writeZip(entries), 'application/zip');
+    } catch (err) {
+      setStatus('Could not build the zip (' + (err && err.message ? err.message : String(err)) + '). Download the files one at a time.');
+    }
   });
 
   function render() {
     list.textContent = '';
     empty.hidden = files.length !== 0;
-    stripBtn.disabled = files.length === 0;
+    stripBtn.disabled = busy || files.length === 0;
     files.forEach(function (file) { list.appendChild(card(file)); });
   }
 

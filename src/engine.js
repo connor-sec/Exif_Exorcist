@@ -105,12 +105,27 @@
 
   function startsWith(b, arr) { return bytesEq(b, 0, arr); }
 
-  async function inflate(bytes, format) {
+  /* Decompression is capped so a small crafted file cannot expand until the tab dies. */
+  var MAX_INFLATE = 512 * 1024 * 1024;
+
+  async function inflate(bytes, format, limit) {
     if (!bytes.length) return new Uint8Array(0);
+    var max = limit > 0 ? limit : MAX_INFLATE;
     var ds = new DecompressionStream(format);
-    var stream = new Blob([bytes]).stream().pipeThrough(ds);
-    var buf = await new Response(stream).arrayBuffer();
-    return new Uint8Array(buf);
+    var reader = new Blob([bytes]).stream().pipeThrough(ds).getReader();
+    var parts = [];
+    var total = 0;
+    for (;;) {
+      var step = await reader.read();
+      if (step.done) break;
+      total += step.value.length;
+      if (total > max) {
+        reader.cancel().catch(function () { /* already failing */ });
+        throw new Error('Compressed data expands past the ' + Math.ceil(max / 1048576) + ' MB safety limit.');
+      }
+      parts.push(step.value);
+    }
+    return concat(parts);
   }
 
   var CRC_TABLE = (function () {
@@ -175,28 +190,54 @@
   function parseXmp(data, source) {
     var text = typeof data === 'string' ? data : new TextDecoder('utf-8', { fatal: false }).decode(data);
     var items = [];
-    var re = /<([A-Za-z0-9]+):([A-Za-z0-9]+)>([^<]{1,800})<\/\1:\2>/g;
+    var MAX_ITEMS = 500;
+    /* Simple properties: <ns:Name>value</ns:Name>, with or without attributes on the tag. */
+    var re = /<([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)(?:\s[^<>]*)?>([^<]{1,800})<\/\1:\2>/g;
     var m;
     var skip = { li: 1, Seq: 1, Alt: 1, Bag: 1, Description: 1, RDF: 1, xmpmeta: 1 };
-    while ((m = re.exec(text))) {
+    while ((m = re.exec(text)) && items.length < MAX_ITEMS) {
       if (skip[m[2]]) continue;
       var value = decodeXml(m[3]).trim();
       if (!value) continue;
       items.push(item(m[2], value, 'XMP', source));
     }
-    var attr = /(?:exif|tiff|photoshop|xmp|dc|pdf|xmpRights):([A-Za-z0-9]+)="([^"]*)"/g;
-    while ((m = attr.exec(text))) {
-      var v = decodeXml(m[2]).trim();
+    /* Array properties: <dc:creator><rdf:Seq><rdf:li>value</rdf:li></rdf:Seq></dc:creator>.
+       This is how creator, subject, title, and rights are normally written. */
+    var arr = /<([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)(?:\s[^<>]*)?>\s*<rdf:(?:Seq|Alt|Bag)(?:\s[^<>]*)?>([\s\S]{0,8000}?)<\/rdf:(?:Seq|Alt|Bag)>/g;
+    var li = /<rdf:li(?:\s[^<>]*)?>([^<]{1,800})<\/rdf:li>/g;
+    var lm;
+    while ((m = arr.exec(text)) && items.length < MAX_ITEMS) {
+      li.lastIndex = 0;
+      while ((lm = li.exec(m[3])) && items.length < MAX_ITEMS) {
+        var lv = decodeXml(lm[1]).trim();
+        if (lv) items.push(item(m[2], lv, 'XMP', source));
+      }
+    }
+    /* Attribute form: any namespace (aux:SerialNumber, xmpMM:DocumentID, exifEX:..., and so on). */
+    var skipPrefix = { xmlns: 1, xml: 1, rdf: 1 };
+    var attr = /\s([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+    while ((m = attr.exec(text)) && items.length < MAX_ITEMS) {
+      if (skipPrefix[m[1]]) continue;
+      var v = decodeXml(m[3] != null ? m[3] : m[4]).trim();
       if (!v) continue;
-      items.push(item(m[1], v, 'XMP', source));
+      items.push(item(m[2], v, 'XMP', source));
     }
     return items;
   }
 
   function findIso6709(bytes) {
-    var s = latin1(bytes);
-    var m = s.match(/[+-]\d{2}\.\d{2,}[+-]\d{2,3}\.\d{2,}/);
-    return m ? m[0] : null;
+    /* Scan in windows. One string for the whole file fails outright on large files
+       (engines cap string length) and that would take the whole scan down with it. */
+    var re = /[+-]\d{2}\.\d{2,}[+-]\d{2,3}\.\d{2,}/;
+    var step = 0x100000;
+    var overlap = 64;
+    for (var i = 0; i < bytes.length; i += step) {
+      var last = i + step >= bytes.length;
+      var m = latin1(bytes.subarray(i, Math.min(bytes.length, i + step + overlap))).match(re);
+      /* A hit that starts in the overlap is read again, whole, by the next window. */
+      if (m && (last || m.index < step)) return m[0];
+    }
+    return null;
   }
 
   function hasExifHeader(bytes) {
@@ -284,13 +325,21 @@
     284: 1, 317: 1, 320: 1, 322: 1, 323: 1, 324: 1, 325: 1, 338: 1, 339: 1,
     274: 1, 282: 1, 283: 1, 296: 1, 513: 1, 514: 1, 512: 1, 517: 1, 518: 1,
     519: 1, 520: 1, 521: 1, 529: 1, 530: 1, 531: 1, 532: 1, 33421: 1, 33422: 1,
-    36864: 1, 37121: 1, 40960: 1, 40961: 1, 0: 0
+    36864: 1, 37121: 1, 40960: 1, 40961: 1, 0: 0,
+    254: 1, 255: 1, 266: 1, 292: 1, 293: 1, 297: 1, 301: 1, 318: 1, 319: 1,
+    332: 1, 334: 1, 336: 1, 340: 1, 341: 1, 347: 1
   };
   var KEEP_TIFF = {
     256: 1, 257: 1, 258: 1, 259: 1, 262: 1, 273: 1, 277: 1, 278: 1, 279: 1,
     284: 1, 317: 1, 320: 1, 322: 1, 323: 1, 324: 1, 325: 1, 338: 1, 339: 1,
     274: 1, 282: 1, 283: 1, 296: 1, 513: 1, 514: 1, 512: 1, 517: 1, 518: 1,
-    519: 1, 520: 1, 521: 1, 529: 1, 530: 1, 531: 1, 532: 1, 33421: 1, 33422: 1
+    529: 1, 530: 1, 531: 1, 532: 1, 33421: 1, 33422: 1,
+    /* Needed to decode or order the picture, and carry no descriptive text:
+       subfile type, fill order, CCITT T4/T6 options, page number, transfer function,
+       white point, primaries, ink set, ink count, dot range, sample min/max, JPEG tables.
+       Dropping fill order, the T4/T6 options, or JPEGTables leaves a file that no longer decodes. */
+    254: 1, 255: 1, 266: 1, 292: 1, 293: 1, 297: 1, 301: 1, 318: 1, 319: 1,
+    332: 1, 334: 1, 336: 1, 340: 1, 341: 1, 347: 1
   };
 
   function typeSize(type) {
@@ -326,17 +375,32 @@
     var view = tiffView(data);
     var out = [];
     var i;
-    if (type === 1 || type === 7 || type === 6) {
-      for (i = 0; i < count && i < data.length; i++) out.push(data[i]);
-    } else if (type === 3 || type === 8) {
+    var size = typeSize(type);
+    /* Never read past the bytes that were actually fetched. */
+    if (size && count > Math.floor(data.length / size)) count = Math.floor(data.length / size);
+    if (type === 1 || type === 7) {
+      for (i = 0; i < count; i++) out.push(data[i]);
+    } else if (type === 6) {
+      for (i = 0; i < count; i++) out.push(view.getInt8(i));
+    } else if (type === 3) {
       for (i = 0; i < count; i++) out.push(view.getUint16(i * 2, le));
-    } else if (type === 4 || type === 9 || type === 13) {
+    } else if (type === 8) {
+      for (i = 0; i < count; i++) out.push(view.getInt16(i * 2, le));
+    } else if (type === 4 || type === 13) {
       for (i = 0; i < count; i++) out.push(view.getUint32(i * 4, le));
-    } else if (type === 5 || type === 10) {
+    } else if (type === 9) {
+      for (i = 0; i < count; i++) out.push(view.getInt32(i * 4, le));
+    } else if (type === 5) {
       for (i = 0; i < count; i++) {
         var n = view.getUint32(i * 8, le);
         var d = view.getUint32(i * 8 + 4, le) || 1;
         out.push(n / d);
+      }
+    } else if (type === 10) {
+      for (i = 0; i < count; i++) {
+        var sn = view.getInt32(i * 8, le);
+        var sd = view.getInt32(i * 8 + 4, le) || 1;
+        out.push(sn / sd);
       }
     }
     return out;
@@ -422,7 +486,7 @@
           display = asciiFrom(data);
         } else if (type === 1 && tag === 0 && group === 'GPS') {
           display = data ? Array.prototype.join.call(data, '.') : '';
-        } else if (type === 1 || type === 3 || type === 4 || type === 5 || type === 9 || type === 10) {
+        } else if (type === 1 || type === 3 || type === 4 || type === 5 || type === 6 || type === 8 || type === 9 || type === 10) {
           var nums = readNumbers(data, hdr.le, type, cnt);
           display = formatNumbers(tag, group, nums);
         } else if (type === 7) {
@@ -434,7 +498,10 @@
         if (display) items.push(item(name, display, group, source || 'TIFF'));
       }
       var next = hdr.view.getUint32(off + 2 + count * 12, hdr.le);
-      if ((group === 'IFD0' || group === 'IFD1') && next) walk(next, group === 'IFD0' ? 'IFD1' : 'IFD2', depth + 1);
+      /* Follow the whole page chain, not just the first three directories.
+         A multi-page TIFF can carry tags on any page. */
+      var page = /^IFD(\d+)$/.exec(group);
+      if (page && next && Number(page[1]) < 255) walk(next, 'IFD' + (Number(page[1]) + 1), depth);
     }
 
     walk(hdr.first, 'IFD0', 0);
@@ -460,7 +527,10 @@
     var pages = [];
     var seen = Object.create(null);
     var off = hdr.first;
-    while (off && !seen[off] && pages.length < 32) {
+    var MAX_PAGES = 4096;
+    while (off && !seen[off]) {
+      /* Refuse rather than quietly hand back a document with pages missing. */
+      if (pages.length >= MAX_PAGES) throw new Error('TIFF has more than ' + MAX_PAGES + ' pages.');
       seen[off] = 1;
       if (off + 2 > bytes.length) break;
       var count = hdr.view.getUint16(off, hdr.le);
@@ -472,8 +542,16 @@
         var tag = hdr.view.getUint16(e, hdr.le);
         var type = hdr.view.getUint16(e + 2, hdr.le);
         var cnt = hdr.view.getUint32(e + 4, hdr.le);
+        if (tag === 330 || tag === 50706) {
+          /* SubIFDs hold the real picture in DNG and most camera raw files.
+             A rebuild from the top-level directories would keep only the preview. */
+          throw new Error('TIFF uses SubIFDs (DNG and camera raw files do). Rebuilding it would drop image data.');
+        }
+        if (tag === 519 || tag === 520 || tag === 521) {
+          throw new Error('Old-style JPEG-in-TIFF (separate table offsets) is not supported.');
+        }
         var data = readInlineOrPointed(bytes, hdr, 0, type, cnt, e + 8);
-        var nums = readNumbers(data, hdr.le, type, Math.min(cnt, 100000));
+        var nums = readNumbers(data, hdr.le, type, cnt);
         if (tag === 259 && nums.length) compression = nums[0];
         entries.push({
           tag: tag, type: type, count: cnt, data: data, nums: nums,
@@ -498,23 +576,31 @@
       var counts = entry(page, 279) || entry(page, 325);
       var jpegOff = entry(page, 513);
       var blobs = [];
-      if (strips && strips.nums && strips.nums.length && counts && counts.nums) {
+      var isJpeg = page.compression === 6 || page.compression === 7;
+      if (strips) {
+        /* Offsets without matching byte counts used to become zero-length strips. */
+        if (!strips.nums.length || !counts || counts.nums.length !== strips.nums.length || strips.nums.length !== strips.count) {
+          throw new Error('TIFF strip or tile offsets and byte counts do not match on page ' + (p + 1) + '.');
+        }
         for (var s = 0; s < strips.nums.length; s++) {
           var start = strips.nums[s];
-          var len = counts.nums[s] || 0;
+          var len = counts.nums[s];
           if (start + len > bytes.length) throw new Error('TIFF strip extends past the end of the file.');
           var blob = bytes.slice(start, start + len);
-          blob = stripJpegBlob(blob);
+          /* Only JPEG-compressed data is a JPEG. Raw pixels can start with FF D8 too. */
+          if (isJpeg) blob = stripJpegBlob(blob);
           blobs.push(blob);
         }
       } else if (jpegOff && jpegOff.nums && jpegOff.nums.length) {
         var jlenE = entry(page, 514);
         var jstart = jpegOff.nums[0];
         var jlen = jlenE && jlenE.nums.length ? jlenE.nums[0] : 0;
+        if (!jlen) throw new Error('TIFF JPEG data has no length on page ' + (p + 1) + '.');
         if (jstart + jlen > bytes.length) throw new Error('TIFF JPEG blob extends past the end of the file.');
         blobs.push(stripJpegBlob(bytes.slice(jstart, jstart + jlen)));
       }
-      if (!blobs.length) continue;
+      /* A page this code cannot carry over is a reason to stop, not a page to drop. */
+      if (!blobs.length) throw new Error('TIFF page ' + (p + 1) + ' has no image data this tool can copy.');
       var kept = [];
       for (var k = 0; k < page.entries.length; k++) {
         var ent = page.entries[k];
@@ -655,22 +741,57 @@
 
   function scanJpeg(bytes) {
     var items = [];
-    var notes = [];
-    walkJpeg(bytes, function (marker, payload) {
+    var end = walkJpeg(bytes, function (marker, payload) {
       if (marker === 0xfe) {
         items.push(item('Comment', asciiFrom(payload), 'JPEG', 'JPEG COM'));
       } else if (marker === 0xe1 && ascii(payload, 0, 6) === 'Exif\x00\x00') {
-        items.push.apply(items, parseTiffMetadata(payload, 6, 'JPEG APP1 EXIF'));
+        var exif = parseTiffMetadata(payload, 6, 'JPEG APP1 EXIF');
+        if (exif.length) items.push.apply(items, exif);
+        else items.push(item('EXIF', 'EXIF segment (' + payload.length + ' bytes)', 'JPEG', 'JPEG APP1 EXIF'));
       } else if (marker === 0xe1 && ascii(payload, 0, 29) === 'http://ns.adobe.com/xap/1.0/\x00') {
-        items.push.apply(items, parseXmp(payload.subarray(29), 'JPEG APP1 XMP'));
+        var xmp = parseXmp(payload.subarray(29), 'JPEG APP1 XMP');
+        if (xmp.length) items.push.apply(items, xmp);
+        else items.push(item('XMP', 'XMP segment (' + payload.length + ' bytes)', 'JPEG', 'JPEG APP1 XMP'));
       } else if (marker === 0xed && ascii(payload, 0, 14) === 'Photoshop 3.0\x00') {
-        items.push.apply(items, parseIptcFrom8bim(payload.subarray(14)));
+        var iptc = parseIptcFrom8bim(payload.subarray(14));
+        if (iptc.length) items.push.apply(items, iptc);
+        else items.push(item('Photoshop', 'Photoshop resource segment (' + payload.length + ' bytes)', 'JPEG', 'JPEG APP13'));
       } else if (marker === 0xe2 && ascii(payload, 0, 4) === 'MPF\x00') {
         items.push(item('MPF', 'Multi-Picture Format segment', 'JPEG', 'JPEG APP2'));
+      } else if (marker === 0xe2 && ascii(payload, 0, 12) === 'ICC_PROFILE\x00') {
+        items.push(item('ICC profile', 'Color profile segment', 'JPEG', 'JPEG APP2'));
+      } else if (marker === 0xe0 && ascii(payload, 0, 5) === 'JFIF\x00') {
+        /* Plain JFIF header: density only. Not listed. */
+      } else if (marker === 0xee && ascii(payload, 0, 5) === 'Adobe') {
+        /* Color transform marker. Kept by the stripper on purpose. */
+      } else if (marker >= 0xe0 && marker <= 0xef) {
+        /* Everything else the stripper removes is listed too, so the report
+           and the re-scan cover the same set: JFXX thumbnails, extended XMP,
+           FlashPix, JUMBF / C2PA, maker segments. */
+        items.push(item(jpegMarkerName(marker, payload), 'Application segment (' + payload.length + ' bytes)', 'JPEG', 'JPEG APP' + (marker - 0xe0)));
       }
       return true;
-    }, notes);
+    });
+    if (end < bytes.length) {
+      items.push(item('Trailing data', (bytes.length - end) + ' bytes after the end-of-image marker', 'JPEG', 'JPEG trailer'));
+    }
     return items;
+  }
+
+  function exifOrientation(payload) {
+    try {
+      var hdr = readTiffHeader(payload, 6);
+      if (!hdr) return 0;
+      var off = 6 + hdr.first;
+      if (off + 2 > payload.length) return 0;
+      var count = hdr.view.getUint16(off, hdr.le);
+      for (var i = 0; i < count; i++) {
+        var e = off + 2 + i * 12;
+        if (e + 12 > payload.length) return 0;
+        if (hdr.view.getUint16(e, hdr.le) === 274) return hdr.view.getUint16(e + 8, hdr.le);
+      }
+    } catch (err) { /* not readable, so nothing to say about it */ }
+    return 0;
   }
 
   function parseIptcFrom8bim(data) {
@@ -713,6 +834,7 @@
   function walkJpeg(bytes, onSegment) {
     if (!(bytes[0] === 0xff && bytes[1] === 0xd8)) throw new Error('Not a JPEG.');
     var i = 2;
+    var sawEoi = false;
     while (i < bytes.length) {
       if (bytes[i] !== 0xff) throw new Error('Lost JPEG marker sync.');
       i++;
@@ -720,7 +842,7 @@
       if (i >= bytes.length) break;
       var marker = bytes[i++];
       if (marker === 0xd9 || marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7)) {
-        if (marker === 0xd9) break;
+        if (marker === 0xd9) { sawEoi = true; break; }
         continue;
       }
       if (i + 2 > bytes.length) throw new Error('Truncated JPEG segment.');
@@ -743,6 +865,8 @@
         continue;
       }
     }
+    /* Where the picture ends. Anything after this offset is trailing data. */
+    return sawEoi ? i : bytes.length;
   }
 
   function stripJpeg(bytes) {
@@ -750,6 +874,8 @@
     var parts = [bytes.subarray(0, 2)];
     var notes = [];
     var i = 2;
+    var trailing = 0;
+    var orientation = 0;
     while (i < bytes.length) {
       if (bytes[i] !== 0xff) throw new Error('Lost JPEG marker sync.');
       var markerStart = i;
@@ -759,6 +885,7 @@
       var marker = bytes[i++];
       if (marker === 0xd9) {
         parts.push(bytes.subarray(markerStart, i));
+        trailing = bytes.length - i;
         break;
       }
       if (marker === 0x00 || (marker >= 0xd0 && marker <= 0xd7)) {
@@ -789,21 +916,34 @@
       var why = dropJpegMarker(marker, payload);
       if (why) notes.push(why);
       else parts.push(bytes.subarray(markerStart, segEnd));
+      if (marker === 0xe1 && !orientation && ascii(payload, 0, 6) === 'Exif\x00\x00') orientation = exifOrientation(payload);
       i = segEnd;
     }
     if (!notes.length) notes.push('No JPEG metadata segments were present.');
     else if (notes.some(function (n) { return n.indexOf('ICC') >= 0; })) notes.push('The ICC profile was removed. Colors may shift.');
+    if (orientation > 1 && orientation <= 8) {
+      notes.push('The EXIF orientation flag (value ' + orientation + ') went with the EXIF segment. The pixels were not rotated, so the picture may now display sideways or mirrored.');
+    }
+    if (trailing > 0) {
+      notes.push('Removed ' + trailing + ' bytes that followed the end-of-image marker (for example a second embedded picture or a motion-photo video).');
+    }
     return { bytes: concat(parts), notes: notes };
   }
 
   /* ------------------------------------------------------------------ PNG */
 
-  var PNG_KEEP = { IHDR: 1, PLTE: 1, IDAT: 1, IEND: 1, tRNS: 1, gAMA: 1, cHRM: 1, sRGB: 1, bKGD: 1, sBIT: 1, pHYs: 1, cICP: 1 };
+  /* acTL / fcTL / fdAT are the animation in an APNG. Without them the file
+     silently becomes a still. mDCV / cLLI are HDR rendering parameters. */
+  var PNG_KEEP = {
+    IHDR: 1, PLTE: 1, IDAT: 1, IEND: 1, tRNS: 1, gAMA: 1, cHRM: 1, sRGB: 1, bKGD: 1, sBIT: 1, pHYs: 1, cICP: 1,
+    acTL: 1, fcTL: 1, fdAT: 1, mDCV: 1, cLLI: 1
+  };
   var PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
   function walkPng(bytes, fn) {
     if (!startsWith(bytes, PNG_SIG)) throw new Error('Not a PNG.');
     var i = 8;
+    var ended = false;
     while (i + 12 <= bytes.length) {
       var len = u32be(bytes, i);
       var type = ascii(bytes, i + 4, 4);
@@ -812,14 +952,16 @@
       var whole = bytes.subarray(i, i + 12 + len);
       fn(type, data, whole);
       i += 12 + len;
-      if (type === 'IEND') break;
+      if (type === 'IEND') { ended = true; break; }
     }
+    /* Offset just past IEND. Bytes after it are not part of the picture. */
+    return ended ? i : bytes.length;
   }
 
   async function scanPngFull(bytes) {
     var items = [];
     var jobs = [];
-    walkPng(bytes, function (type, data) {
+    var pngEnd = walkPng(bytes, function (type, data) {
       if (type === 'tEXt') {
         var z = indexOfBytes(data, [0]);
         var key = latin1(data.subarray(0, z < 0 ? data.length : z));
@@ -838,13 +980,19 @@
         items.push(item(type, 'Metadata chunk (' + data.length + ' bytes)', 'PNG', 'PNG chunk'));
       }
     });
+    if (pngEnd < bytes.length) {
+      items.push(item('Trailing data', (bytes.length - pngEnd) + ' bytes after the IEND chunk', 'PNG', 'PNG trailer'));
+    }
+    /* Text chunks are small. Anything that inflates past this is not a caption. */
+    var TEXT_LIMIT = 16 * 1024 * 1024;
     for (var i = 0; i < jobs.length; i++) {
       var job = jobs[i];
       try {
         if (job.type === 'zTXt') {
           var z0 = indexOfBytes(job.data, [0]);
+          if (z0 < 0) throw new Error('zTXt chunk has no keyword terminator.');
           var keyz = latin1(job.data.subarray(0, z0));
-          var inflated = await inflate(job.data.subarray(z0 + 2), 'deflate');
+          var inflated = await inflate(job.data.subarray(z0 + 2), 'deflate', TEXT_LIMIT);
           var text = new TextDecoder().decode(inflated);
           if (/xmp/i.test(keyz)) items.push.apply(items, parseXmp(text, 'PNG zTXt'));
           else items.push(item(keyz || 'zTXt', text.trim(), 'PNG', 'PNG zTXt'));
@@ -855,7 +1003,7 @@
           var lang = readCString(job.data, p); p = lang.end;
           var trans = readCString(job.data, p); p = trans.end;
           var rest = job.data.subarray(p);
-          var body = job.data[keyi.end] ? new TextDecoder().decode(await inflate(rest, 'deflate')) : new TextDecoder().decode(rest);
+          var body = job.data[keyi.end] ? new TextDecoder().decode(await inflate(rest, 'deflate', TEXT_LIMIT)) : new TextDecoder().decode(rest);
           if (/xmp|XML/i.test(keyi.s)) items.push.apply(items, parseXmp(body, 'PNG iTXt'));
           else if (body.trim()) items.push(item(keyi.s || 'iTXt', body.trim(), 'PNG', 'PNG iTXt'));
         }
@@ -875,24 +1023,42 @@
   function stripPng(bytes) {
     var parts = [bytes.subarray(0, 8)];
     var notes = [];
-    walkPng(bytes, function (type, data, whole) {
+    var end = walkPng(bytes, function (type, data, whole) {
       if (PNG_KEEP[type]) parts.push(whole);
       else notes.push('Removed PNG ' + type + ' chunk');
     });
     if (!notes.length) notes.push('No PNG metadata chunks were present.');
     if (notes.some(function (n) { return n.indexOf('iCCP') >= 0; })) notes.push('The ICC profile was removed. Colors may shift.');
+    if (end < bytes.length) notes.push('Removed ' + (bytes.length - end) + ' bytes that followed the IEND chunk.');
     return { bytes: concat(parts), notes: notes };
   }
 
   /* ------------------------------------------------------------------ WebP */
 
-  function walkWebp(bytes, fn) {
+  /* The chunks the WebP container defines for picture data. Everything else goes. */
+  var WEBP_KEEP = { 'VP8 ': 1, 'VP8L': 1, 'VP8X': 1, 'ALPH': 1, 'ANIM': 1, 'ANMF': 1 };
+
+  function webpChunkName(type) {
+    return type.replace(/[^\x20-\x7e]/g, '?');
+  }
+
+  function walkWebp(bytes, fn, strict) {
     if (ascii(bytes, 0, 4) !== 'RIFF' || ascii(bytes, 8, 4) !== 'WEBP') throw new Error('Not a WebP.');
     var i = 12;
-    while (i + 8 <= bytes.length) {
+    var end = bytes.length;
+    /* When rewriting, stop at the size the RIFF header declares. Bytes appended
+       after the container are not chunks and are not copied. */
+    var riff = u32le(bytes, 4);
+    if (strict && riff >= 4 && 8 + riff < end) end = 8 + riff;
+    while (i + 8 <= end) {
       var type = ascii(bytes, i, 4);
       var size = u32le(bytes, i + 4);
-      if (i + 8 + size > bytes.length) break;
+      if (i + 8 + size > end) {
+        /* When rewriting, a chunk that runs past the end must not be dropped in silence:
+           it may be the picture. */
+        if (strict) throw new Error('Truncated WebP chunk.');
+        break;
+      }
       fn(type, bytes.subarray(i + 8, i + 8 + size));
       i += 8 + size + (size & 1);
     }
@@ -901,8 +1067,21 @@
   function scanWebp(bytes) {
     var items = [];
     walkWebp(bytes, function (type, data) {
-      if (type === 'EXIF') items.push.apply(items, parseTiffMetadata(data, 0, 'WebP EXIF'));
-      else if (type === 'XMP ' || type === 'XMP\0') items.push.apply(items, parseXmp(data, 'WebP XMP'));
+      if (type === 'EXIF') {
+        /* Some writers put the JPEG-style "Exif\0\0" prefix in front of the TIFF header. */
+        var base = ascii(data, 0, 6) === 'Exif\x00\x00' ? 6 : 0;
+        var exif = parseTiffMetadata(data, base, 'WebP EXIF');
+        if (exif.length) items.push.apply(items, exif);
+        else items.push(item('EXIF', 'EXIF chunk (' + data.length + ' bytes)', 'WebP', 'WebP EXIF'));
+      } else if (type === 'XMP ' || type === 'XMP\0') {
+        var xmp = parseXmp(data, 'WebP XMP');
+        if (xmp.length) items.push.apply(items, xmp);
+        else items.push(item('XMP', 'XMP chunk (' + data.length + ' bytes)', 'WebP', 'WebP XMP'));
+      } else if (type === 'ICCP') {
+        items.push(item('ICC profile', 'Color profile chunk', 'WebP', 'WebP ICCP'));
+      } else if (!WEBP_KEEP[type]) {
+        items.push(item(webpChunkName(type), 'Unrecognized chunk (' + data.length + ' bytes)', 'WebP', 'WebP chunk'));
+      }
     });
     return items;
   }
@@ -914,12 +1093,16 @@
       if (type === 'EXIF') { notes.push('Removed WebP EXIF chunk'); return; }
       if (type === 'XMP ' || type === 'XMP\0') { notes.push('Removed WebP XMP chunk'); return; }
       if (type === 'ICCP') { notes.push('Removed WebP ICC profile. Colors may shift.'); return; }
+      if (!WEBP_KEEP[type]) { notes.push('Removed unrecognized WebP chunk ' + webpChunkName(type)); return; }
       var copy = data.slice();
       if (type === 'VP8X' && copy.length) {
         copy[0] = copy[0] & ~0x2c;
       }
       chunks.push({ type: type, data: copy });
-    });
+    }, true);
+    if (!chunks.some(function (c) { return c.type === 'VP8 ' || c.type === 'VP8L' || c.type === 'ANMF'; })) {
+      throw new Error('WebP has no image data chunk.');
+    }
     var parts = [new Uint8Array(12)];
     for (var i = 0; i < chunks.length; i++) {
       var h = new Uint8Array(8);
@@ -941,13 +1124,20 @@
 
   function scanGif(bytes) {
     var items = [];
-    walkGif(bytes, function (kind, data, app) {
-      if (kind === 'comment') items.push(item('Comment', asciiFrom(data), 'GIF', 'GIF comment'));
-      else if (kind === 'app' && ascii(app, 0, 11) === 'XMP DataXMP') items.push.apply(items, parseXmp(data, 'GIF XMP'));
+    var end = walkGif(bytes, function (kind, data, app) {
+      if (kind === 'comment') items.push(item('Comment', asciiFrom(data) || '(empty comment)', 'GIF', 'GIF comment'));
+      else if (kind === 'app' && ascii(app, 0, 11) === 'XMP DataXMP') {
+        var xmp = parseXmp(data, 'GIF XMP');
+        if (xmp.length) items.push.apply(items, xmp);
+        else items.push(item('XMP', 'XMP extension (' + data.length + ' bytes)', 'GIF', 'GIF XMP'));
+      }
       else if (kind === 'app' && ascii(app, 0, 11) !== 'NETSCAPE2.0' && ascii(app, 0, 8) !== 'ANIMEXTS') {
-        items.push(item('Application', latin1(app.subarray(0, 11)), 'GIF', 'GIF application'));
+        items.push(item('Application', asciiFrom(app.subarray(0, 11)) || 'Application extension', 'GIF', 'GIF application'));
       }
     });
+    if (end < bytes.length) {
+      items.push(item('Trailing data', (bytes.length - end) + ' bytes after the GIF trailer', 'GIF', 'GIF trailer'));
+    }
     return items;
   }
 
@@ -958,7 +1148,7 @@
     var i = 13 + gct;
     while (i < bytes.length) {
       var b = bytes[i];
-      if (b === 0x3b) break;
+      if (b === 0x3b) return i + 1;
       if (b === 0x2c) {
         var ip = bytes[i + 9];
         var lct = (ip & 0x80) ? (3 * (1 << ((ip & 7) + 1))) : 0;
@@ -994,6 +1184,7 @@
       }
       throw new Error('Unexpected GIF block.');
     }
+    return bytes.length;
   }
 
   function stripGif(bytes) {
@@ -1004,9 +1195,10 @@
     var parts = [bytes.subarray(0, headerEnd)];
     var notes = [];
     var i = headerEnd;
+    var trailing = 0;
     while (i < bytes.length) {
       var b = bytes[i];
-      if (b === 0x3b) { parts.push(bytes.subarray(i, i + 1)); break; }
+      if (b === 0x3b) { parts.push(bytes.subarray(i, i + 1)); trailing = bytes.length - (i + 1); break; }
       if (b === 0x2c) {
         var start = i;
         var ip = bytes[i + 9];
@@ -1044,6 +1236,7 @@
       throw new Error('Unexpected GIF block.');
     }
     if (!notes.length) notes.push('No GIF comment or XMP extensions were present.');
+    if (trailing > 0) notes.push('Removed ' + trailing + ' bytes that followed the GIF trailer.');
     return { bytes: concat(parts), notes: notes };
   }
 
