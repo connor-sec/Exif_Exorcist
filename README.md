@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" alt="Exif Exorcist logo" width="300"></p>
+
 # Exif Exorcist
 
 An offline, single-file HTML tool that strips metadata from files in your browser. Drag files in, read what it found, strip the containers that hold it, and re-scan before you download. No network, no install, nothing leaves the page.
