@@ -813,7 +813,17 @@
      (which usually contains the Windows user name). Values are blanked, not
      removed, so every index and reference in the document still resolves. */
   var OFFICE_SCRUB = [
-    { re: /\b((?:[A-Za-z0-9]+:)?(?:author|initials|userId|userName|lastModifiedBy))=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
+    { re: /\b((?:[A-Za-z0-9]+:)?(?:author|initials|userId|userName|lastModifiedBy|refreshedBy))=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
+    /* Revision and comment timestamps, and the revision save ids Word uses to
+       tell editing sessions apart. All are optional attributes. */
+    { file: /^word\//i, re: /\s+w(?:16du)?:date(?:Utc)?=(?:"[^"]*"|'[^']*')/g, to: '' },
+    { file: /^word\//i, re: /\s+w:rsid[A-Za-z]*=(?:"[^"]*"|'[^']*')/g, to: '' },
+    { file: /^word\/settings\.xml$/i, re: /<w:rsids\b[^>]*>[\s\S]*?<\/w:rsids>/g, to: '' },
+    /* The attached template and the mail merge source are stored as paths on
+       the author's machine. */
+    { file: /^word\/settings\.xml$/i, re: /<w:attachedTemplate\b[^>]*?(?:\/>|>\s*<\/w:attachedTemplate>)/g, to: '' },
+    { file: /^word\/settings\.xml$/i, re: /<w:mailMerge\b[^>]*>[\s\S]*?<\/w:mailMerge>/g, to: '' },
+    { file: /\.rels$/i, re: /<Relationship\b[^>]*\/(?:attachedTemplate|mailMergeSource|mailMergeHeaderSource|thumbnail)"[^>]*?(?:\/>|>\s*<\/Relationship>)/g, to: '' },
     { file: /(?:commentAuthors|(?:^|\/)authors)\.xml$/i, re: /\b(name)=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
     { file: /persons\/[^\/]*\.xml$/i, re: /\b(displayName)=(?:"[^"]*"|'[^']*')/g, to: '$1=""' },
     { file: /comments?\d*\.xml$/i, re: /(<(?:[A-Za-z0-9]+:)?author(?:\s[^<>]*)?>)[^<]*(<\/(?:[A-Za-z0-9]+:)?author>)/g, to: '$1$2' },
@@ -822,29 +832,142 @@
   ];
   /* The same idea for OpenDocument: change-tracking and annotation authors
      live in content.xml and styles.xml, not in meta.xml. */
+  var ODF_EPOCH = '1970-01-01T00:00:00';
   var ODF_SCRUB = [
     { re: /(<dc:creator>)[^<]*(<\/dc:creator>)/g, to: '$1$2' },
-    { re: /(<meta:creator-initials>)[^<]*(<\/meta:creator-initials>)/g, to: '$1$2' }
+    { re: /(<meta:creator-initials>)[^<]*(<\/meta:creator-initials>)/g, to: '$1$2' },
+    /* change-info needs a dc:date to stay valid, so the time is reset, not removed. */
+    { re: /(<dc:date>)[^<]*(<\/dc:date>)/g, to: function (_, a, b) { return a + ODF_EPOCH + b; } }
   ];
+  /* settings.xml records the printer, its driver blob, and the data source
+     the document was last connected to. */
+  var ODF_SETTINGS_NAMES = 'PrinterName|PrinterSetup|PrintFaxName|CurrentDatabaseDataSource|CurrentDatabaseCommand';
+  var ODF_SETTINGS_SCRUB = new RegExp('(<config:config-item\\b[^>]*config:name="(?:' + ODF_SETTINGS_NAMES + ')"[^>]*>)[^<]+(<\\/config:config-item>)', 'g');
+
+  /* A path on the machine that wrote the file. It usually holds the account
+     name. Matched in the scan only: where the path sits decides whether it
+     can be taken out without breaking the document. */
+  var LOCAL_PATH = /file:\/\/[^"'<>\s]+|(?:^|[^A-Za-z0-9])[A-Za-z]:\\[^"'<>|?*\r\n]{2,}|\\\\[A-Za-z0-9._$-]+\\[^"'<>|?*\r\n]+|\/(?:Users|home)\/[^\/"'<>\s]+\/[^"'<>\s]*/g;
+
+  function relsSource(relsName) {
+    var m = /^(.*?)_rels\/([^\/]+)\.rels$/i.exec(relsName);
+    return m ? m[1] + m[2] : null;
+  }
+  function resolvePart(source, target) {
+    if (target.charAt(0) === '/') return target.slice(1);
+    var base = source.split('/');
+    base.pop();
+    var parts = target.split('/');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === '..') base.pop();
+      else if (parts[i] !== '.' && parts[i] !== '') base.push(parts[i]);
+    }
+    return base.join('/');
+  }
+  function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  /* Printer settings parts name the printer and often the print server. A
+     part is dropped only when every reference to it could be taken out of
+     the sheet or section that points at it. Otherwise it stays and the scan
+     reports it. */
+  function planPrinterRemoval(entries) {
+    var byName = {};
+    for (var i = 0; i < entries.length; i++) byName[entries[i].name] = entries[i];
+    var plan = { parts: {}, relIds: {}, text: {} };
+    var blocked = {};
+    var dec = new TextDecoder('utf-8', { fatal: false });
+    for (var r = 0; r < entries.length; r++) {
+      var relsName = entries[r].name;
+      if (!/\.rels$/i.test(relsName)) continue;
+      var source = relsSource(relsName);
+      if (!source || !byName[source]) continue;
+      var relText = dec.decode(entries[r].data);
+      var tagRe = /<Relationship\b[^>]*>/g;
+      var tm;
+      while ((tm = tagRe.exec(relText))) {
+        var tag = tm[0];
+        if (!/Type="[^"]*\/printerSettings"/.test(tag)) continue;
+        var idm = /\bId="([^"]+)"/.exec(tag);
+        var tgm = /\bTarget="([^"]+)"/.exec(tag);
+        if (!idm || !tgm) continue;
+        var part = resolvePart(source, tgm[1]);
+        var text = plan.text[source] != null ? plan.text[source] : dec.decode(byName[source].data);
+        var id = escapeRe(idm[1]);
+        var next = text
+          .replace(new RegExp('<w:printerSettings\\b[^>]*\\b[A-Za-z0-9]+:id="' + id + '"[^>]*?(?:\\/>|>\\s*<\\/w:printerSettings>)', 'g'), '')
+          .replace(new RegExp('(<(?:[A-Za-z0-9]+:)?pageSetup\\b[^>]*?)\\s+[A-Za-z0-9]+:id="' + id + '"', 'g'), '$1');
+        if (new RegExp('\\b[A-Za-z0-9]+:id="' + id + '"').test(next)) { blocked[part] = 1; continue; }
+        plan.text[source] = next;
+        plan.parts[part] = 1;
+        if (!plan.relIds[relsName]) plan.relIds[relsName] = {};
+        plan.relIds[relsName][idm[1]] = 1;
+      }
+    }
+    for (var b in blocked) delete plan.parts[b];
+    return plan;
+  }
 
   /* What the scrub rules above target, as report rows. The scan and the
      scrub have to agree, or the re-scan cannot vouch for the scrub. */
+  function addLocalPaths(text, add) {
+    var seen = {};
+    var m;
+    LOCAL_PATH.lastIndex = 0;
+    var count = 0;
+    while ((m = LOCAL_PATH.exec(text)) && count < 10) {
+      var path = m[0].replace(/^[^A-Za-z\\\/]/, '');
+      if (seen[path]) continue;
+      seen[path] = 1;
+      count++;
+      add('Local path', path);
+    }
+  }
+
   function officeIdentityItems(name, text, label, odf) {
     var items = [];
     var m;
     function add(tag, value) {
       value = String(value || '').trim();
+      if (value.length > 200) value = value.slice(0, 200) + '…';
       if (value && items.length < 40) items.push(item(tag, value, label, name));
     }
     if (odf) {
       if (/^(?:content|styles)\.xml$/i.test(name)) {
         var oc = /<(?:dc:(creator)|meta:(creator-initials))>([^<]+)</g;
         while ((m = oc.exec(text))) add(m[1] || m[2], m[3]);
+        var od = /<dc:date>([^<]+)</g;
+        var odCount = 0;
+        while ((m = od.exec(text)) && odCount < 5) {
+          if (m[1].trim() === ODF_EPOCH) continue;
+          odCount++;
+          add('date', m[1]);
+        }
+        if (/<text:tracked-changes\b[^>]*>\s*<text:changed-region\b/.test(text)) add('Tracked changes', 'Tracked changes are still in the document, including any deleted text. Accept or reject them in the editor.');
+        addLocalPaths(text, add);
+      }
+      if (/^settings\.xml$/i.test(name)) {
+        var os = new RegExp('<config:config-item\\b[^>]*config:name="(' + ODF_SETTINGS_NAMES + ')"[^>]*>([^<]+)<', 'g');
+        while ((m = os.exec(text))) add(m[1], m[2]);
+        addLocalPaths(text, add);
       }
       return items;
     }
-    var attr = /\b(?:[A-Za-z0-9]+:)?(author|initials|userId|userName|lastModifiedBy)=(?:"([^"]+)"|'([^']+)')/g;
+    var attr = /\b(?:[A-Za-z0-9]+:)?(author|initials|userId|userName|lastModifiedBy|refreshedBy)=(?:"([^"]+)"|'([^']+)')/g;
     while ((m = attr.exec(text))) add(m[1], m[2] != null ? m[2] : m[3]);
+    if (/^word\//i.test(name)) {
+      var wd = /\sw(?:16du)?:date(?:Utc)?=(?:"([^"]+)"|'([^']+)')/g;
+      var dates = 0;
+      while ((m = wd.exec(text)) && dates++ < 5) add('revision date', m[1] != null ? m[1] : m[2]);
+      if (/\sw:rsid[A-Za-z]*=|<w:rsids\b/.test(text)) add('rsid', 'Revision save identifiers');
+      if (/<w:attachedTemplate\b/.test(text)) add('attachedTemplate', 'Attached template reference');
+      if (/<w:mailMerge\b/.test(text)) add('mailMerge', 'Mail merge data source settings');
+      if (/<w:(?:ins|del|moveFrom|moveTo)\b/.test(text)) add('Tracked changes', 'Tracked insertions or deletions are still in the document, including any deleted text. Accept or reject them in Word.');
+    }
+    if (/(?:^|\/)connections\.xml$/i.test(name)) {
+      var cn = /\b(connection|sourceFile|odcFile|url)=(?:"([^"]+)"|'([^']+)')/g;
+      while ((m = cn.exec(text))) add('Data connection', m[2] != null ? m[2] : m[3]);
+    }
+    addLocalPaths(text, add);
     if (/(?:commentAuthors|(?:^|\/)authors)\.xml$/i.test(name)) {
       var nm = /\bname=(?:"([^"]+)"|'([^']+)')/g;
       while ((m = nm.exec(text))) add('author', m[1] != null ? m[1] : m[2]);
@@ -870,10 +993,21 @@
     return new TextEncoder().encode(next);
   }
 
-  function scrubOfficeXml(name, data) {
-    var text = new TextDecoder('utf-8', { fatal: false }).decode(data);
-    var orig = text;
+  function scrubOfficeXml(name, data, plan) {
+    var orig = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    var text = plan && plan.text[name] != null ? plan.text[name] : orig;
     var notes = [];
+    if (text !== orig) notes.push('Removed the printer settings reference in ' + name);
+    if (plan && name === '[Content_Types].xml') {
+      for (var gone in plan.dropped) {
+        text = text.replace(new RegExp('<Override\\b[^>]*PartName="/' + escapeRe(gone) + '"[^>]*?(?:\\/>|>\\s*<\\/Override>)', 'g'), '');
+      }
+    }
+    if (plan && plan.relIds[name]) {
+      for (var rid in plan.relIds[name]) {
+        text = text.replace(new RegExp('<Relationship\\b[^>]*\\bId="' + escapeRe(rid) + '"[^>]*?(?:\\/>|>\\s*<\\/Relationship>)', 'g'), '');
+      }
+    }
     /* Only the three property parts are removed, so only their entries go.
        Both spellings of an empty element are matched: a relationship left
        pointing at a deleted part makes Office report the file as damaged. */
@@ -889,7 +1023,7 @@
         if (OFFICE_SCRUB[r].file && !OFFICE_SCRUB[r].file.test(name)) continue;
         next = next.replace(OFFICE_SCRUB[r].re, OFFICE_SCRUB[r].to);
       }
-      if (next !== text) notes.push('Cleared author and user identifiers in ' + name);
+      if (next !== text) notes.push('Cleared names, dates, and other identifying details in ' + name);
       text = next;
     }
     if (text === orig) return { changed: false, data: data, notes: notes };
@@ -940,6 +1074,11 @@
         var xml = new TextDecoder('utf-8', { fatal: false }).decode(e.data);
         items.push.apply(items, officeIdentityItems(e.name, xml, kind.label, odf));
       }
+      if (!odf) {
+        if (/^docprops\/thumbnail\.[a-z0-9]+$/.test(lower)) items.push(item('Thumbnail', 'Preview image of the first page', kind.label, e.name));
+        if (/(?:^|\/)printersettings\/[^\/]+$/.test(lower)) items.push(item('Printer settings', 'Printer and driver settings (' + e.data.length + ' bytes)', kind.label, e.name));
+        if (/^customxml\/item\d*\.xml$/.test(lower)) items.push(item('Custom XML part', 'Custom XML data (' + e.data.length + ' bytes). It can hold document-library properties. Remove it with the Document Inspector in Office if it is not needed.', kind.label, e.name));
+      }
       /* Embedded parts are scanned with the full detector, so a workbook
          behind a chart or a document inside a document is opened too. Before,
          nested packages were skipped and could not hold back a clear result. */
@@ -974,10 +1113,23 @@
         }
       }
     }
+    var plan = null;
+    if (!odf) {
+      plan = planPrinterRemoval(entries);
+      plan.dropped = {};
+      for (var pp in plan.parts) plan.dropped[pp] = 1;
+      for (var t = 0; t < entries.length; t++) {
+        if (/^docprops\/thumbnail\.[a-z0-9]+$/i.test(entries[t].name)) plan.dropped[entries[t].name] = 1;
+      }
+    }
     for (var i = 0; i < entries.length; i++) {
       var e = entries[i];
       var lower = e.name.toLowerCase();
       if (!odf && /^docprops\/(core|app|custom)\.xml$/.test(lower)) {
+        notes.push('Removed ' + e.name);
+        continue;
+      }
+      if (plan && plan.dropped[e.name]) {
         notes.push('Removed ' + e.name);
         continue;
       }
@@ -989,10 +1141,17 @@
         var odfScrub = scrubOdfXml(data);
         if (odfScrub) {
           data = odfScrub;
-          notes.push('Cleared change-tracking and comment author names in ' + e.name);
+          notes.push('Cleared change-tracking and comment author names and dates in ' + e.name);
+        }
+      } else if (odf && lower === 'settings.xml') {
+        var setText = new TextDecoder('utf-8', { fatal: false }).decode(data);
+        var setNext = setText.replace(ODF_SETTINGS_SCRUB, '$1$2');
+        if (setNext !== setText) {
+          data = new TextEncoder().encode(setNext);
+          notes.push('Cleared the printer and data source names in settings.xml');
         }
       } else if (!odf && /\.(xml|rels)$/i.test(e.name)) {
-        var scrub = scrubOfficeXml(e.name, data);
+        var scrub = scrubOfficeXml(e.name, data, plan);
         if (scrub.changed) {
           data = scrub.data;
           notes.push.apply(notes, scrub.notes);
@@ -1507,6 +1666,72 @@
     return [];
   }
 
+  /* Annotation types a reviewer creates. Widget is left out: on a form field
+     /T is the field name, not a person. */
+  var PDF_MARKUP = {
+    Text: 1, FreeText: 1, Line: 1, Square: 1, Circle: 1, Polygon: 1, PolyLine: 1, Highlight: 1,
+    Underline: 1, Squiggly: 1, StrikeOut: 1, Stamp: 1, Caret: 1, Ink: 1, FileAttachment: 1, Sound: 1, Redact: 1
+  };
+  function pdfIsMarkup(dict) {
+    var st = dict.get('Subtype');
+    return !!(st && st.type === 'name' && PDF_MARKUP[st.name] && dict.get('Rect'));
+  }
+  function pdfOmitKeys(dict) {
+    var keys = {};
+    var any = false;
+    var out = { keys: keys, annot: false, priv: false };
+    function drop(name, flag) {
+      if (dict.get(name)) { keys[name] = 1; any = true; if (flag) out[flag] = true; }
+    }
+    if (pdfIsMarkup(dict)) { drop('T', 'annot'); drop('M', 'annot'); drop('CreationDate', 'annot'); drop('NM', 'annot'); }
+    var type = dict.get('Type');
+    var typeName = type && type.type === 'name' ? type.name : '';
+    if (dict.get('PieceInfo')) { drop('PieceInfo', 'priv'); drop('LastModified', 'priv'); }
+    else if (typeName === 'Page' || typeName === 'Catalog') drop('LastModified', 'priv');
+    if (typeName !== 'Metadata') {
+      var meta = dict.get('Metadata');
+      if (meta && meta.type === 'ref') drop('Metadata');
+    }
+    return any ? out : null;
+  }
+  function pdfValueText(v) {
+    if (!v) return '';
+    if (v.type === 'string') return pdfString(v.raw);
+    if (v.type === 'hex') return pdfHex(v.raw);
+    if (v.type === 'name') return v.name;
+    return latin1(v.raw);
+  }
+  /* What pdfOmitKeys removes, plus file attachments, which are reported and
+     left in place because they are part of the document. */
+  function scanPdfObjects(loaded) {
+    var items = [];
+    var MAX = 60;
+    var infoRef = loaded.trailer.get('Info');
+    loaded.objects.forEach(function (obj, id) {
+      if (items.length >= MAX || !obj.value || obj.value.type !== 'dict') return;
+      if (infoRef && infoRef.type === 'ref' && id === infoRef.id) return;
+      var d = obj.value;
+      var where = 'PDF object ' + id;
+      if (pdfIsMarkup(d)) {
+        ['T', 'M', 'CreationDate', 'NM'].forEach(function (k) {
+          var text = pdfValueText(d.get(k)).trim();
+          if (text) items.push(item(k === 'T' ? 'Annotation author' : k === 'NM' ? 'Annotation id' : 'Annotation date', text, 'PDF', where));
+        });
+      }
+      var type = d.get('Type');
+      var typeName = type && type.type === 'name' ? type.name : '';
+      if (d.get('PieceInfo')) items.push(item('PieceInfo', 'Application private data', 'PDF', where));
+      if (d.get('LastModified') && (d.get('PieceInfo') || typeName === 'Page' || typeName === 'Catalog')) {
+        items.push(item('LastModified', pdfValueText(d.get('LastModified')).trim() || 'Last-modified time', 'PDF', where));
+      }
+      if (typeName === 'Filespec' || d.get('EF')) {
+        var fname = pdfValueText(d.get('UF') || d.get('F')).trim();
+        items.push(item('Attachment', (fname || 'Embedded file') + '. Attachments are left in place. Remove the attachment in a PDF editor if it should not be shared.', 'PDF', where));
+      }
+    });
+    return items;
+  }
+
   async function stripPdf(bytes) {
     var loaded = await loadPdf(bytes);
     var trailer = loaded.trailer;
@@ -1527,14 +1752,26 @@
     }
     if (metaRef && metaRef.type === 'ref') {
       skip[metaRef.id] = 1;
-      if (root.value.type === 'dict') {
-        var gen = root.gen || 0;
-        replacement[root.id] = fromLatin1(root.id + ' ' + gen + ' obj\n' + emitDict(root.value, { Metadata: 1 }) + '\nendobj\n');
-        notes.push('Removed the catalog Metadata reference and dropped the metadata stream.');
-      }
+      if (root.value.type === 'dict') notes.push('Removed the catalog Metadata reference and dropped the metadata stream.');
     }
+    var annotCleared = 0;
+    var privateCleared = 0;
     objects.forEach(function (obj, id) {
       if (!obj.value || obj.value.type !== 'dict') return;
+      if (infoRef && infoRef.type === 'ref' && id === infoRef.id) return;
+      /* Reviewer names and times on comments and markup, application private
+         data, and per-object Metadata references. The keys are optional, so
+         the dictionary is written again without them. */
+      var omit = pdfOmitKeys(obj.value);
+      if (omit) {
+        var dictOut = emitDict(obj.value, omit.keys, obj.stream ? { Length: String(obj.stream.length) } : null);
+        var objHead = obj.id + ' ' + (obj.gen || 0) + ' obj\n' + dictOut;
+        replacement[id] = obj.stream
+          ? concat([fromLatin1(objHead + '\nstream\n'), obj.stream, fromLatin1('\nendstream\nendobj\n')])
+          : fromLatin1(objHead + '\nendobj\n');
+        if (omit.annot) annotCleared++;
+        if (omit.priv) privateCleared++;
+      }
       var type = obj.value.get('Type');
       if (type && type.type === 'name' && (type.name === 'Metadata' || type.name === 'XRef' || type.name === 'ObjStm')) skip[id] = 1;
       var subtype = obj.value.get('Subtype');
@@ -1550,7 +1787,7 @@
           return;
         }
         if (stripped.bytes.length !== obj.stream.length || indexOfBytes(obj.stream, [0x45, 0x78, 0x69, 0x66, 0x00, 0x00]) >= 0) {
-          var dictText = emitDict(obj.value, null, { Length: String(stripped.bytes.length) });
+          var dictText = emitDict(obj.value, omit ? omit.keys : null, { Length: String(stripped.bytes.length) });
           var head = fromLatin1(obj.id + ' ' + obj.gen + ' obj\n' + dictText + '\nstream\n');
           var tail = fromLatin1('\nendstream\nendobj\n');
           replacement[id] = concat([head, stripped.bytes, tail]);
@@ -1558,6 +1795,8 @@
         }
       }
     });
+    if (annotCleared) notes.push('Cleared the author, date, and id on ' + annotCleared + ' comment or markup annotation' + (annotCleared === 1 ? '' : 's') + '.');
+    if (privateCleared) notes.push('Removed application private data (PieceInfo) and last-modified times from ' + privateCleared + ' object' + (privateCleared === 1 ? '' : 's') + '.');
     if (!notes.length) notes.push('No document information dictionary or metadata stream was found. The file was still rewritten without incremental-update history.');
     var ids = Array.from(objects.keys()).filter(function (id) { return id > 0 && !skip[id]; }).sort(function (a, b) { return a - b; });
     var chunks = [pdfHeader(bytes)];
@@ -1708,6 +1947,7 @@
         if (filters.length === 1 && filters[0] === 'FlateDecode') data = await inflate(stream, 'deflate');
         items.push.apply(items, parseXmp(data, 'PDF XMP'));
       }
+      items.push.apply(items, scanPdfObjects(loaded));
     } catch (e) {
       items.push(item('PDF', 'Could not fully parse this PDF (' + e.message + ')', 'PDF', 'PDF'));
     }

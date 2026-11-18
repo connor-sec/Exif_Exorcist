@@ -9,7 +9,8 @@ const ui = readFileSync(join(root, 'src/ui.js'), 'utf8');
 if (engine.includes('</script>') || ui.includes('</script>')) {
   throw new Error('Inline script would close the HTML script element.');
 }
-const html = shell.replace('@@ENGINE@@', engine).replace('@@UI@@', ui);
+// A function replacement, so a "$&" or "$'" inside the scripts is copied as written.
+const html = shell.replace('@@ENGINE@@', () => engine).replace('@@UI@@', () => ui);
 if (html.includes('@@ENGINE@@') || html.includes('@@UI@@')) throw new Error('Placeholder left in HTML.');
 writeFileSync(join(root, 'Exif-Exorcist-v1.0.html'), html);
 console.log('Wrote Exif-Exorcist-v1.0.html', html.length, 'bytes');

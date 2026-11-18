@@ -565,6 +565,250 @@ const DOC_XML = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordproc
   assert(nodeSha(packedPng) === batch.manifest.files[2].sha256, 'batch manifest hash matches the png bytes in the zip');
 }
 
+/* ---- Identity data outside the property parts: Office, OpenDocument, PDF ---- */
+
+const REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const PKG_RELS = 'xmlns="http://schemas.openxmlformats.org/package/2006/relationships"';
+function zipText(bytes, name) {
+  const dir = mkdtempSync(join(tmpdir(), 'exif-exorcist-zip-'));
+  const path = join(dir, 'x.zip');
+  writeFileSync(path, bytes);
+  try {
+    // Brackets are glob characters to unzip, so [Content_Types].xml is escaped.
+    return execFileSync('unzip', ['-p', path, name.replace(/[\[\]]/g, '\\$&')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch (e) {
+    return null;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+function zipNames(bytes) {
+  const dir = mkdtempSync(join(tmpdir(), 'exif-exorcist-zip-'));
+  const path = join(dir, 'x.zip');
+  writeFileSync(path, bytes);
+  const out = execFileSync('unzip', ['-Z1', path], { encoding: 'utf8' }).trim().split('\n');
+  rmSync(dir, { recursive: true, force: true });
+  return out;
+}
+
+{ // Word: template path, mail merge source, revision dates and ids, thumbnail.
+  const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="' + REL_NS + '"';
+  const settings = '<w:settings ' + W + '><w:zoom w:percent="100"/><w:attachedTemplate r:id="rId1"/><w:rsids><w:rsidRoot w:val="00AB12CD"/><w:rsid w:val="00AB12CD"/></w:rsids><w:mailMerge><w:query w:val="SELECT * FROM `C:\\Users\\JaneDoe\\list.xlsx`"/></w:mailMerge></w:settings>';
+  const settingsRels = '<Relationships ' + PKG_RELS + '><Relationship Id="rId1" Type="' + REL_NS + '/attachedTemplate" Target="file:///C:\\Users\\JaneDoe\\AppData\\Roaming\\Microsoft\\Templates\\Acme.dotm" TargetMode="External"/></Relationships>';
+  const doc = '<w:document ' + W + '><w:body><w:p w:rsidR="00AB12CD" w:rsidRDefault="00AB12CD"><w:r><w:t>Hello</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">kept </w:t></w:r></w:p></w:body></w:document>';
+  const comments = '<w:comments ' + W + '><w:comment w:id="0" w:author="Jane Doe" w:date="2024-07-04T13:37:00Z" w:initials="JD"/></w:comments>';
+  const rootRels = '<Relationships ' + PKG_RELS + '><Relationship Id="rId1" Type="' + REL_NS + '/officeDocument" Target="word/document.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail" Target="docProps/thumbnail.jpeg"/></Relationships>';
+  const docx = EE.writeZip([
+    { name: '[Content_Types].xml', data: enc.encode(CT_WORD) },
+    { name: '_rels/.rels', data: enc.encode(rootRels) },
+    { name: 'word/document.xml', data: enc.encode(doc) },
+    { name: 'word/comments.xml', data: enc.encode(comments) },
+    { name: 'word/settings.xml', data: enc.encode(settings) },
+    { name: 'word/_rels/settings.xml.rels', data: enc.encode(settingsRels) },
+    { name: 'docProps/thumbnail.jpeg', data: Uint8Array.of(0xff, 0xd8, 0xff, 0xd9) }
+  ]);
+  const before = await EE.scan(docx);
+  const tags = before.items.map((i) => i.tag);
+  for (const tag of ['Local path', 'revision date', 'rsid', 'attachedTemplate', 'mailMerge', 'Thumbnail']) {
+    assert(tags.includes(tag), 'Word scan reports ' + tag);
+  }
+  const r = await run(docx);
+  assert(r.stripped.ok, 'Word file with template path stripped');
+  assert(r.verdict.level === 'clear', 'Word template/mail-merge verdict ' + r.verdict.level + ' after ' + JSON.stringify(r.after.items.map((i) => i.tag + '@' + i.source)));
+  const all = zipNames(r.stripped.bytes).map((n) => zipText(r.stripped.bytes, n) || '').join('\n');
+  assert(!/JaneDoe|Acme\.dotm|00AB12CD|2024-07-04/.test(all), 'Word template path, merge source, rsids, and revision dates are gone');
+  assert(!zipNames(r.stripped.bytes).includes('docProps/thumbnail.jpeg'), 'Word thumbnail part is removed');
+  assert(!/thumbnail/.test(zipText(r.stripped.bytes, '_rels/.rels')), 'thumbnail relationship is removed with the part');
+  const outSettings = zipText(r.stripped.bytes, 'word/settings.xml');
+  assert(/<w:zoom w:percent="100"\/>/.test(outSettings) && !/attachedTemplate|mailMerge|rsid/.test(outSettings), 'settings keep unrelated elements');
+  assert(/xml:space="preserve">kept </.test(zipText(r.stripped.bytes, 'word/document.xml')), 'document text and other attributes are untouched');
+}
+
+{ // Word: tracked changes and custom XML are reported and keep the file from being called clear.
+  const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const doc = '<w:document ' + W + '><w:body><w:p><w:del w:id="2" w:author="Jane Doe" w:date="2024-07-04T13:38:00Z"><w:r><w:delText>old wording</w:delText></w:r></w:del></w:p></w:body></w:document>';
+  const tracked = EE.writeZip([
+    { name: '[Content_Types].xml', data: enc.encode(CT_WORD) },
+    { name: 'word/document.xml', data: enc.encode(doc) }
+  ]);
+  const r = await run(tracked);
+  assert(r.stripped.ok && r.verdict.level === 'residual', 'tracked changes block a clear result, got ' + r.verdict.level);
+  assert(r.after.items.some((i) => i.tag === 'Tracked changes'), 'tracked changes are named in the re-scan');
+  assert(!/Jane Doe|2024-07-04/.test(zipText(r.stripped.bytes, 'word/document.xml')), 'tracked change author and date are cleared');
+  assert(/old wording/.test(zipText(r.stripped.bytes, 'word/document.xml')), 'tracked change text is left for the author to resolve');
+
+  const custom = EE.writeZip([
+    { name: '[Content_Types].xml', data: enc.encode(CT_WORD) },
+    { name: 'word/document.xml', data: enc.encode(DOC_XML) },
+    { name: 'customXml/item1.xml', data: enc.encode('<root xmlns="urn:x"><owner>Jane Doe</owner></root>') }
+  ]);
+  const rc = await run(custom);
+  assert(rc.verdict.level === 'residual' && rc.after.items.some((i) => i.tag === 'Custom XML part'), 'custom XML part blocks a clear result, got ' + rc.verdict.level);
+}
+
+{ // Excel: printer settings go with their references; connections and link paths are reported.
+  const S = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="' + REL_NS + '"';
+  const CT_XL = CT_WORD.replace(/wordprocessingml\.document/g, 'spreadsheetml.sheet').replace('/word/document.xml', '/xl/workbook.xml');
+  const sheet = '<worksheet ' + S + '><sheetData/><pageSetup orientation="landscape" r:id="rId1"/></worksheet>';
+  const sheetRels = '<Relationships ' + PKG_RELS + '><Relationship Id="rId1" Type="' + REL_NS + '/printerSettings" Target="../printerSettings/printerSettings1.bin"/></Relationships>';
+  const pivot = '<pivotCacheDefinition ' + S + ' refreshedBy="Jane Doe" recordCount="0"/>';
+  const printer = new Uint8Array(Buffer.from('\\\\PRINTSRV\\JaneDoe-HP', 'utf16le'));
+  const base = [
+    { name: '[Content_Types].xml', data: enc.encode(CT_XL) },
+    { name: 'xl/workbook.xml', data: enc.encode('<workbook ' + S + '/>') },
+    { name: 'xl/worksheets/sheet1.xml', data: enc.encode(sheet) },
+    { name: 'xl/worksheets/_rels/sheet1.xml.rels', data: enc.encode(sheetRels) },
+    { name: 'xl/printerSettings/printerSettings1.bin', data: printer },
+    { name: 'xl/pivotCache/pivotCacheDefinition1.xml', data: enc.encode(pivot) }
+  ];
+  const xlsx = EE.writeZip(base);
+  const before = await EE.scan(xlsx);
+  assert(before.items.some((i) => i.tag === 'Printer settings') && before.items.some((i) => i.tag === 'refreshedBy'), 'Excel scan reports printer settings and refreshedBy');
+  const r = await run(xlsx);
+  assert(r.verdict.level === 'clear', 'Excel printer/pivot verdict ' + r.verdict.level + ' after ' + JSON.stringify(r.after.items.map((i) => i.tag + '@' + i.source)));
+  assert(!zipNames(r.stripped.bytes).some((n) => /printerSettings/.test(n)), 'printer settings part is removed');
+  assert(/<pageSetup orientation="landscape"\/>/.test(zipText(r.stripped.bytes, 'xl/worksheets/sheet1.xml')), 'pageSetup keeps its settings and loses the printer reference');
+  assert(!/printerSettings/.test(zipText(r.stripped.bytes, 'xl/worksheets/_rels/sheet1.xml.rels')), 'printer settings relationship is removed');
+  assert(!/Jane Doe/.test(zipText(r.stripped.bytes, 'xl/pivotCache/pivotCacheDefinition1.xml')), 'pivot cache refreshedBy is cleared');
+
+  // A reference the stripper does not know how to remove keeps the part in place.
+  const odd = base.slice();
+  odd[2] = { name: 'xl/worksheets/sheet1.xml', data: enc.encode('<worksheet ' + S + '><sheetData/><unknownThing r:id="rId1"/></worksheet>') };
+  const ro = await run(EE.writeZip(odd));
+  assert(zipNames(ro.stripped.bytes).some((n) => /printerSettings1\.bin/.test(n)), 'printer settings stay when a reference cannot be removed');
+  assert(/printerSettings/.test(zipText(ro.stripped.bytes, 'xl/worksheets/_rels/sheet1.xml.rels')), 'their relationship stays too, so nothing dangles');
+  assert(ro.verdict.level === 'residual', 'kept printer settings block a clear result, got ' + ro.verdict.level);
+
+  const conn = '<connections ' + S + '><connection id="1" name="q"><dbPr connection="Provider=SQLOLEDB;Data Source=sql01.example.test;User ID=JaneDoe"/></connection></connections>';
+  const linkRels = '<Relationships ' + PKG_RELS + '><Relationship Id="rId1" Type="' + REL_NS + '/externalLinkPath" Target="file:///C:\\Users\\JaneDoe\\budget.xlsx" TargetMode="External"/></Relationships>';
+  const linked = EE.writeZip([
+    { name: '[Content_Types].xml', data: enc.encode(CT_XL) },
+    { name: 'xl/workbook.xml', data: enc.encode('<workbook ' + S + '/>') },
+    { name: 'xl/connections.xml', data: enc.encode(conn) },
+    { name: 'xl/externalLinks/_rels/externalLink1.xml.rels', data: enc.encode(linkRels) }
+  ]);
+  const rl = await run(linked);
+  assert(rl.verdict.level === 'residual', 'data connection and external link verdict ' + rl.verdict.level);
+  assert(rl.after.items.some((i) => i.tag === 'Data connection') && rl.after.items.some((i) => i.tag === 'Local path'), 'connection string and link path are named in the re-scan');
+}
+
+{ // OpenDocument: printer and data source in settings.xml, and change-tracking dates.
+  const O = 'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:config="urn:oasis:names:tc:opendocument:xmlns:config:1.0"';
+  const settings = '<office:document-settings ' + O + '><office:settings><config:config-item-set config:name="ooo:configuration-settings"><config:config-item config:name="PrinterName" config:type="string">\\\\PRINTSRV\\JaneDoe-HP</config:config-item><config:config-item config:name="CurrentDatabaseDataSource" config:type="string">C:\\Users\\JaneDoe\\db.odb</config:config-item><config:config-item config:name="PrinterPaperFromSetup" config:type="boolean">false</config:config-item></config:config-item-set></office:settings></office:document-settings>';
+  const content = '<office:document-content ' + O + '><office:body><office:text><text:p>Hello<office:annotation><dc:creator>Jane Doe</dc:creator><dc:date>2024-07-04T13:37:00</dc:date><text:p>note</text:p></office:annotation></text:p></office:text></office:body></office:document-content>';
+  const odt = EE.writeZip([
+    { name: 'mimetype', data: enc.encode('application/vnd.oasis.opendocument.text') },
+    { name: 'content.xml', data: enc.encode(content) },
+    { name: 'settings.xml', data: enc.encode(settings) }
+  ]);
+  const before = await EE.scan(odt);
+  assert(before.items.some((i) => i.tag === 'PrinterName') && before.items.some((i) => i.tag === 'date'), 'ODF scan reports the printer name and the annotation date');
+  const r = await run(odt);
+  assert(r.verdict.level === 'clear', 'ODF settings verdict ' + r.verdict.level + ' after ' + JSON.stringify(r.after.items.map((i) => i.tag + '@' + i.source)));
+  const outSettings = zipText(r.stripped.bytes, 'settings.xml');
+  assert(!/JaneDoe|PRINTSRV/.test(outSettings), 'ODF printer and data source names are cleared');
+  assert(/PrinterPaperFromSetup" config:type="boolean">false</.test(outSettings), 'other ODF settings keep their values');
+  const outContent = zipText(r.stripped.bytes, 'content.xml');
+  assert(!/2024-07-04|Jane Doe/.test(outContent) && /<dc:date>1970-01-01T00:00:00<\/dc:date>/.test(outContent), 'ODF annotation date is reset and stays a valid date');
+}
+
+function buildPdf(objs) {
+  let out = '%PDF-1.7\n';
+  const offs = {};
+  for (const [n, body] of objs) {
+    offs[n] = out.length;
+    out += n + ' 0 obj\n' + body + '\nendobj\n';
+  }
+  const max = Math.max(...objs.map((o) => o[0])) + 1;
+  const xref = out.length;
+  out += 'xref\n0 ' + max + '\n0000000000 65535 f \n';
+  for (let i = 1; i < max; i++) out += String(offs[i] || 0).padStart(10, '0') + (offs[i] ? ' 00000 n \n' : ' 65535 f \n');
+  out += 'trailer\n<< /Size ' + max + ' /Root 1 0 R /Info 2 0 R >>\nstartxref\n' + xref + '\n%%EOF\n';
+  return bin(out);
+}
+
+{ // PDF: reviewer names and times on annotations, PieceInfo, and page timestamps.
+  const content = 'BT ET';
+  const objs = [
+    [1, '<< /Type /Catalog /Pages 3 0 R /PieceInfo << /App << /LastModified (D:20240704133742Z) /Private << /Owner (Jane Doe) >> >> >> /AcroForm << /Fields [8 0 R] >> >>'],
+    [2, '<< /Producer (Test) >>'],
+    [3, '<< /Type /Pages /Kids [4 0 R] /Count 1 >>'],
+    [4, '<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R] /LastModified (D:20240704133742Z) >>'],
+    [5, '<< /Length ' + content.length + ' >>\nstream\n' + content + '\nendstream'],
+    [6, '<< /Type /Annot /Subtype /Text /Rect [100 100 120 120] /Contents (Please check this figure) /T (Jane Doe) /M (D:20240704133742Z) /CreationDate (D:20240704133742Z) /NM (annot-1234) /Popup 7 0 R >>'],
+    [7, '<< /Type /Annot /Subtype /Popup /Rect [130 100 300 200] /Parent 6 0 R >>'],
+    [8, '<< /Type /Annot /Subtype /Widget /FT /Tx /T (surname) /V (typed value) /Rect [50 600 250 620] >>']
+  ];
+  const pdf = buildPdf(objs);
+  const before = await EE.scan(pdf);
+  assert(before.items.some((i) => i.tag === 'Annotation author' && /Jane Doe/.test(i.value)), 'PDF annotation author is reported');
+  assert(before.items.some((i) => i.tag === 'PieceInfo') && before.items.some((i) => i.tag === 'LastModified'), 'PDF PieceInfo and LastModified are reported');
+  const r = await run(pdf);
+  assert(r.stripped.ok, 'PDF with annotations stripped: ' + (r.stripped.reason || ''));
+  assert(r.verdict.level === 'clear', 'PDF annotation verdict ' + r.verdict.level + ' after ' + JSON.stringify(r.after.items.map((i) => i.tag + '@' + i.source)));
+  const out = str(r.stripped.bytes);
+  assert(!/Jane Doe|20240704|annot-1234|PieceInfo/.test(out), 'PDF annotation author, dates, id, and PieceInfo are gone');
+  assert(/Please check this figure/.test(out), 'PDF annotation text is kept');
+  assert(/\/T \(surname\)/.test(out) && /\/V \(typed value\)/.test(out), 'PDF form field name and value are kept');
+  const outPath = join(work, 'out-annotations.pdf');
+  writeFileSync(outPath, r.stripped.bytes);
+  let qpdfOk = true;
+  try { execFileSync('qpdf', ['--check', outPath], { stdio: 'pipe' }); } catch (e) { qpdfOk = false; }
+  assert(qpdfOk, 'qpdf accepts the PDF after annotations are rewritten');
+
+  // An attachment is part of the document. It is reported and it blocks a clear result.
+  const withFile = buildPdf([
+    [1, '<< /Type /Catalog /Pages 3 0 R /Names << /EmbeddedFiles << /Names [(notes.txt) 6 0 R] >> >> >>'],
+    [2, '<< >>'],
+    [3, '<< /Type /Pages /Kids [4 0 R] /Count 1 >>'],
+    [4, '<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R >>'],
+    [5, '<< /Length 5 >>\nstream\nBT ET\nendstream'],
+    [6, '<< /Type /Filespec /F (JaneDoe-notes.txt) /EF << /F 7 0 R >> >>'],
+    [7, '<< /Type /EmbeddedFile /Length 5 >>\nstream\nhello\nendstream']
+  ]);
+  const rf = await run(withFile);
+  assert(rf.stripped.ok && rf.verdict.level === 'residual', 'PDF attachment verdict ' + rf.verdict.level);
+  assert(rf.after.items.some((i) => i.tag === 'Attachment' && /JaneDoe-notes\.txt/.test(i.value)), 'PDF attachment is named in the re-scan');
+}
+
+{ // GIF plain text extensions carry a string and are removed.
+  const header = cat(bin('GIF89a'), Uint8Array.of(1, 0, 1, 0, 0x80, 0, 0), Uint8Array.of(0, 0, 0, 255, 255, 255));
+  const image = Uint8Array.of(0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0);
+  const text = cat(Uint8Array.of(0x21, 0x01, 12, 0, 0, 0, 0, 8, 0, 8, 0, 8, 8, 1, 0), Uint8Array.of(8), bin('Jane Doe'), Uint8Array.of(0));
+  const gif = cat(header, image, text, Uint8Array.of(0x3b));
+  const before = await EE.scan(gif);
+  assert(before.items.some((i) => i.tag === 'Plain text' && /Jane Doe/.test(i.value)), 'GIF plain text extension is reported');
+  const r = await run(gif);
+  assert(r.stripped.ok && !/Jane Doe/.test(str(r.stripped.bytes)), 'GIF plain text extension is removed');
+  assert(r.verdict.level === 'clear', 'GIF plain text verdict ' + r.verdict.level);
+  assert(r.stripped.bytes.length === header.length + image.length + 1, 'GIF image data is untouched');
+}
+
+{ // The orientation note is given for PNG and WebP too, not only JPEG.
+  const tiff = Uint8Array.of(0x49, 0x49, 0x2a, 0, 8, 0, 0, 0, 1, 0, 0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0);
+  const png = cat(Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a),
+    pngChunk('IHDR', new Uint8Array(13)), pngChunk('eXIf', tiff), pngChunk('IDAT', new Uint8Array(0)), pngChunk('IEND', new Uint8Array(0)));
+  const rp = await run(png);
+  assert(rp.stripped.ok && rp.stripped.notes.some((n) => /orientation flag \(value 6\)/.test(n)), 'PNG orientation loss is noted');
+  function riff(type, data) {
+    const h = new Uint8Array(8);
+    h.set(bin(type), 0);
+    new DataView(h.buffer).setUint32(4, data.length, true);
+    return cat(h, data, data.length & 1 ? new Uint8Array(1) : new Uint8Array(0));
+  }
+  const body = cat(bin('WEBP'), riff('VP8X', Uint8Array.of(0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0)), riff('VP8 ', new Uint8Array(10)), riff('EXIF', tiff));
+  const webp = cat(bin('RIFF'), new Uint8Array(4), body);
+  new DataView(webp.buffer).setUint32(4, body.length, true);
+  const rw = await run(webp);
+  assert(rw.stripped.ok && rw.stripped.notes.some((n) => /orientation flag \(value 6\)/.test(n)), 'WebP orientation loss is noted: ' + (rw.stripped.reason || rw.stripped.notes.join(' | ')));
+}
+
+{ // The page is built from all three sources, not only the engine.
+  const shell = readFileSync(join(root, 'src/shell.html'), 'utf8');
+  const ui = readFileSync(join(root, 'src/ui.js'), 'utf8');
+  assert(html === shell.replace('@@ENGINE@@', () => src).replace('@@UI@@', () => ui), 'Exif-Exorcist-v1.0.html matches src/shell.html, src/engine*.js, and src/ui.js. Run node tests/build_html.mjs.');
+}
+
 rmSync(work, { recursive: true, force: true });
 if (failed) {
   console.error(failed + ' assertion(s) failed');

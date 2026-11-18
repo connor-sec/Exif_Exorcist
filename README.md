@@ -70,12 +70,12 @@ The page still shows metadata values on screen while you review a file. That lis
 | JPEG | `FF D8 FF` | Removes APP segments (keeps the Adobe APP14 color marker) and COM comments. Embedded EXIF, XMP, IPTC, ICC, and MPF go with the segment. | Full |
 | PNG | PNG signature | Removes text, time, EXIF, ICC, and other chunks that are not needed to draw the image. `tRNS` and the color-rendering chunks that are not profiles stay. | Full |
 | WebP | `RIFF` / `WEBP` | Removes EXIF, XMP, and ICCP chunks and clears those flags in `VP8X`. | Full |
-| GIF | `GIF87a` / `GIF89a` | Removes comment and application extensions. Netscape and animation extensions stay, so a multi-frame GIF still animates. | Full |
+| GIF | `GIF87a` / `GIF89a` | Removes comment, plain text, and application extensions. Netscape and animation extensions stay, so a multi-frame GIF still animates. | Full |
 | TIFF | `II*` or `MM*` | Rebuilds a baseline TIFF with image tags only (strips or tiles, photometric interpretation, orientation, resolution). EXIF, GPS, XMP, IPTC, and ICC are not copied. BigTIFF is refused and left untouched. | Full for baseline TIFF |
 | HEIC / HEIF | `ftyp` brand `heic`, `heix`, `hevc`, `hevx`, `mif1`, `msf1`, and the related HEIF brands | Zeros known Exif and XMP item extents in place so `iloc` offsets do not move. | Best effort |
-| PDF | `%PDF` | Rewrites unencrypted files it can parse, including cross-reference streams and object streams. Clears the Info dictionary, drops XMP metadata streams, and strips EXIF from embedded JPEG images. Encrypted PDFs are refused. | Full when the parser accepts the file |
-| DOCX, XLSX, PPTX | ZIP package plus `[Content_Types].xml` | Removes `docProps`, clears `author` attributes, and runs the image stripper on embedded media. | Full |
-| ODT, ODS, ODP | ZIP package plus the ODF `mimetype` entry | Replaces `meta.xml` with an empty `office:meta`. The mimetype entry stays first and uncompressed. | Full |
+| PDF | `%PDF` | Rewrites unencrypted files it can parse, including cross-reference streams and object streams. Clears the Info dictionary, drops XMP metadata streams, and strips EXIF from embedded JPEG images. Clears the author, dates, and id on comment and markup annotations, and removes PieceInfo and page last-modified times. File attachments are left in place and reported. Encrypted PDFs are refused. | Full when the parser accepts the file |
+| DOCX, XLSX, PPTX | ZIP package plus `[Content_Types].xml` | Removes `docProps` (including the thumbnail) and printer settings. Clears `author` attributes, revision dates and save ids, the attached template, and the mail merge source. Runs the image stripper on embedded media. Tracked changes, data connections, links to local files, and custom XML parts are left in place and reported. | Full |
+| ODT, ODS, ODP | ZIP package plus the ODF `mimetype` entry | Replaces `meta.xml` with an empty `office:meta`. Clears comment and change-tracking authors, resets their dates, and clears the printer and data source names in `settings.xml`. Tracked changes are left in place and reported. The mimetype entry stays first and uncompressed. | Full |
 | MP3 | `ID3` or a valid MPEG frame sync | Removes ID3v2, ID3v1, and an APEv2 tag at the end. | Full |
 | MP4, MOV, M4A | `ftyp`, or a QuickTime `moov` / `mdat` / `wide` atom | Removes `udta`, iTunes `meta`, and XMP (`uuid` and `XMP_`). Zeros creation and modification times in `mvhd`, `tkhd`, and `mdhd`. Rewrites `stco` / `co64` after the file shrinks. | Best effort |
 
@@ -85,6 +85,9 @@ AVIF, BigTIFF, encrypted PDF, ZIP64, and ZIP files that are not Office or ODF pa
 
 * Best-effort output is not a certification. Timed GPS and other sample data inside an MP4 or MOV can remain even after user-data atoms are gone. HEIC extents this tool does not understand are left in place.
 * Codec and handler strings inside an MP4 sample description are part of the media structure and are not scrubbed.
+* Some things are part of the document and are not removed: tracked changes and their deleted text, PDF attachments, spreadsheet data connections, links to files on the author's machine, and custom XML parts. The scan lists them, and a file that still has one is reported as still carrying metadata. Resolve them in the application that made the file, then strip again.
+* PDF layer (optional content) creator names and form field values are not examined.
+* An EXIF orientation flag goes with the EXIF block in JPEG, PNG, and WebP. The pixels are not rotated, so a photo taken in portrait can display sideways. The result notes say when this happened.
 * ICC profiles are removed. Colors can shift. The Adobe JPEG APP14 marker is kept so CMYK files still decode.
 * A Word document that talks about GPS in its own paragraph still contains that sentence. If the text contains a marker such as `GPSLatitude`, the re-scan says metadata remains.
 * Canvas re-encode is a different file. It is the right tool when you accept quality loss. It is the wrong tool when you need the original encoding.

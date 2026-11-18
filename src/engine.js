@@ -1023,10 +1023,19 @@
   function stripPng(bytes) {
     var parts = [bytes.subarray(0, 8)];
     var notes = [];
+    var orientation = 0;
     var end = walkPng(bytes, function (type, data, whole) {
       if (PNG_KEEP[type]) parts.push(whole);
-      else notes.push('Removed PNG ' + type + ' chunk');
+      else {
+        notes.push('Removed PNG ' + type + ' chunk');
+        /* eXIf holds a bare TIFF block. exifOrientation expects the six-byte
+           JPEG prefix in front of it. */
+        if (type === 'eXIf' && !orientation) orientation = exifOrientation(concat([new Uint8Array(6), data]));
+      }
     });
+    if (orientation > 1 && orientation <= 8) {
+      notes.push('The EXIF orientation flag (value ' + orientation + ') went with the EXIF chunk. The pixels were not rotated, so the picture may now display sideways or mirrored.');
+    }
     if (!notes.length) notes.push('No PNG metadata chunks were present.');
     if (notes.some(function (n) { return n.indexOf('iCCP') >= 0; })) notes.push('The ICC profile was removed. Colors may shift.');
     if (end < bytes.length) notes.push('Removed ' + (bytes.length - end) + ' bytes that followed the IEND chunk.');
@@ -1089,8 +1098,13 @@
   function stripWebp(bytes) {
     var chunks = [];
     var notes = [];
+    var orientation = 0;
     walkWebp(bytes, function (type, data) {
-      if (type === 'EXIF') { notes.push('Removed WebP EXIF chunk'); return; }
+      if (type === 'EXIF') {
+        notes.push('Removed WebP EXIF chunk');
+        if (!orientation) orientation = exifOrientation(ascii(data, 0, 6) === 'Exif\x00\x00' ? data : concat([new Uint8Array(6), data]));
+        return;
+      }
       if (type === 'XMP ' || type === 'XMP\0') { notes.push('Removed WebP XMP chunk'); return; }
       if (type === 'ICCP') { notes.push('Removed WebP ICC profile. Colors may shift.'); return; }
       if (!WEBP_KEEP[type]) { notes.push('Removed unrecognized WebP chunk ' + webpChunkName(type)); return; }
@@ -1116,6 +1130,9 @@
     out[0] = 0x52; out[1] = 0x49; out[2] = 0x46; out[3] = 0x46;
     setU32le(out, 4, out.length - 8);
     out[8] = 0x57; out[9] = 0x45; out[10] = 0x42; out[11] = 0x50;
+    if (orientation > 1 && orientation <= 8) {
+      notes.push('The EXIF orientation flag (value ' + orientation + ') went with the EXIF chunk. The pixels were not rotated, so the picture may now display sideways or mirrored.');
+    }
     if (!notes.length) notes.push('No WebP metadata chunks were present.');
     return { bytes: out, notes: notes };
   }
@@ -1134,6 +1151,8 @@
       else if (kind === 'app' && ascii(app, 0, 11) !== 'NETSCAPE2.0' && ascii(app, 0, 8) !== 'ANIMEXTS') {
         items.push(item('Application', asciiFrom(app.subarray(0, 11)) || 'Application extension', 'GIF', 'GIF application'));
       }
+      /* A plain text extension is a 12-byte grid header and then the text. */
+      else if (kind === 'text') items.push(item('Plain text', asciiFrom(data.subarray(Math.min(12, data.length))) || '(plain text block)', 'GIF', 'GIF plain text'));
     });
     if (end < bytes.length) {
       items.push(item('Trailing data', (bytes.length - end) + ' bytes after the GIF trailer', 'GIF', 'GIF trailer'));
@@ -1179,6 +1198,7 @@
         var joined = concat(payload.length ? payload : [new Uint8Array(0)]);
         if (ext === 0xfe) fn('comment', joined, null, start, i);
         else if (ext === 0xff) fn('app', joined, app || new Uint8Array(0), start, i);
+        else if (ext === 0x01) fn('text', joined, null, start, i);
         else fn('other', joined, null, start, i);
         continue;
       }
@@ -1229,6 +1249,8 @@
         else if (ext === 0xff && app === 'NETSCAPE2.0') drop = false;
         else if (ext === 0xff && app && app.indexOf('ANIMEXTS') === 0) drop = false;
         else if (ext === 0xff) { drop = true; notes.push('Removed GIF application extension' + (app ? ' (' + app.trim() + ')' : '')); }
+        /* Plain text extensions carry a string that almost no viewer draws. */
+        else if (ext === 0x01) { drop = true; notes.push('Removed GIF plain text extension'); }
         else drop = false;
         if (!drop) parts.push(bytes.subarray(startE, i));
         continue;
