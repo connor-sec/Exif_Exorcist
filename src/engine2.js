@@ -1,5 +1,5 @@
 /*!
- * Exif Exorcist v1.0 — containers, PDF, and the public API.
+ * Exif Exorcist v1.0 — containers, PDF, clean pack, and the public API.
  * Copyright (C) 2026 connor-sec
  * License: AGPL-3.0-only
  */
@@ -1830,16 +1830,506 @@
     mp3: '.mp3', mp4: '.mp4', mov: '.mov', m4a: '.m4a'
   };
 
+  function extensionFor(format) { return EXTENSIONS[format] || '.bin'; }
+
+  /* ------------------------------------------------------------------ clean pack
+     A clean pack is a zip of stripped outputs plus a manifest. The manifest
+     records field names and categories. It never records the values that were
+     in those fields, and it records original filenames or original-file hashes
+     only when the caller opts in. Folder paths are not kept. */
+
+  var SHA256_K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+  var SHA256_H0 = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+  ];
+
+  function rotr32(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0; }
+
+  function hexOf(bytes) {
+    var hex = '';
+    for (var i = 0; i < bytes.length; i++) hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+    return hex;
+  }
+
+  function asBytes(bytes) {
+    if (bytes instanceof Uint8Array) return bytes;
+    if (!bytes || typeof bytes.length !== 'number') return new Uint8Array(0);
+    return new Uint8Array(bytes);
+  }
+
+  /* Used when crypto.subtle is missing. A file:// page is not a secure context
+     in every browser, and subtle is absent there. The digest is still SHA-256. */
+  function sha256Js(bytes) {
+    bytes = asBytes(bytes);
+    var bitLen = bytes.length * 8;
+    var zeroPad = (56 - ((bytes.length + 1) % 64) + 64) % 64;
+    var buf = new Uint8Array(bytes.length + 1 + zeroPad + 8);
+    buf.set(bytes, 0);
+    buf[bytes.length] = 0x80;
+    var view = new DataView(buf.buffer);
+    view.setUint32(buf.length - 8, Math.floor(bitLen / 0x100000000), false);
+    view.setUint32(buf.length - 4, bitLen >>> 0, false);
+    var H = SHA256_H0.slice();
+    var w = new Uint32Array(64);
+    for (var off = 0; off < buf.length; off += 64) {
+      var i;
+      for (i = 0; i < 16; i++) w[i] = view.getUint32(off + i * 4, false);
+      for (i = 16; i < 64; i++) {
+        var s0 = (rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0;
+        var s1 = (rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0;
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (i = 0; i < 64; i++) {
+        var S1 = (rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)) >>> 0;
+        var ch = ((e & f) ^ ((~e) & g)) >>> 0;
+        var t1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+        var S0 = (rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)) >>> 0;
+        var maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+        var t2 = (S0 + maj) >>> 0;
+        h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      H[0] = (H[0] + a) >>> 0; H[1] = (H[1] + b) >>> 0; H[2] = (H[2] + c) >>> 0; H[3] = (H[3] + d) >>> 0;
+      H[4] = (H[4] + e) >>> 0; H[5] = (H[5] + f) >>> 0; H[6] = (H[6] + g) >>> 0; H[7] = (H[7] + h) >>> 0;
+    }
+    var out = new Uint8Array(32);
+    var ov = new DataView(out.buffer);
+    for (var hi = 0; hi < 8; hi++) ov.setUint32(hi * 4, H[hi], false);
+    return hexOf(out);
+  }
+
+  async function sha256Hex(bytes, forceJs) {
+    bytes = asBytes(bytes);
+    if (!forceJs && root.crypto && root.crypto.subtle && typeof root.crypto.subtle.digest === 'function') {
+      try {
+        var digest = await root.crypto.subtle.digest('SHA-256', bytes);
+        return hexOf(new Uint8Array(digest));
+      } catch (err) { /* fall through to the built-in hash */ }
+    }
+    return sha256Js(bytes);
+  }
+
+  function oneLine(text, max) {
+    var s = String(text == null ? '' : text).replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (max && s.length > max) s = s.slice(0, max).trim();
+    return s;
+  }
+
+  function fileBaseName(name) {
+    var s = String(name == null ? '' : name).replace(/\\/g, '/');
+    var slash = s.lastIndexOf('/');
+    if (slash >= 0) s = s.slice(slash + 1);
+    s = s.replace(/[\u0000-\u001f\u007f]/g, '');
+    if (s.length > 180) s = s.slice(0, 180);
+    return s;
+  }
+
+  /* The prefix becomes part of a downloaded filename. Only a short ASCII token
+     is kept, so a pasted path cannot land in the zip as a directory. */
+  function sanitizePrefix(prefix) {
+    var s = oneLine(prefix, 200).replace(/\\/g, '/');
+    var parts = s.split('/');
+    s = parts[parts.length - 1];
+    s = s.replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').replace(/-+/g, '-');
+    if (s.length > 40) s = s.slice(0, 40).replace(/-+$/g, '');
+    if (!s) return 'photo';
+    return s;
+  }
+
+  function outputFilename(original, format) {
+    var base = fileBaseName(original).replace(/\.[^.]+$/, '').replace(/[\\/]/g, '');
+    if (!base || base === '.' || base === '..') base = 'file';
+    if (base.length > 120) base = base.slice(0, 120);
+    return base + '-stripped' + extensionFor(format);
+  }
+
+  function neutralFilename(prefix, seq, count, format) {
+    var width = Math.max(3, String(Math.max(1, count)).length);
+    var n = String(seq);
+    while (n.length < width) n = '0' + n;
+    return sanitizePrefix(prefix) + '-' + n + extensionFor(format);
+  }
+
+  var MANIFEST_NAMES = { 'manifest.json': 1, 'manifest.csv': 1, 'manifest.txt': 1 };
+
+  function uniqueZipName(name, used) {
+    name = fileBaseName(name);
+    if (!name || name === '.' || name === '..') name = 'file.bin';
+    if (MANIFEST_NAMES[name.toLowerCase()]) name = name.replace(/(\.[^.]+)$/, '-file$1');
+    if (!used[name]) { used[name] = 1; return name; }
+    var dot = name.lastIndexOf('.');
+    var ext = dot > 0 ? name.slice(dot) : '';
+    var stem = dot > 0 ? name.slice(0, dot) : name;
+    var n = 2;
+    var candidate = stem + '-' + n + ext;
+    while (used[candidate] || MANIFEST_NAMES[candidate.toLowerCase()]) {
+      n++;
+      candidate = stem + '-' + n + ext;
+    }
+    used[candidate] = 1;
+    return candidate;
+  }
+
+  var CATEGORY_ORDER = [
+    'GPS', 'Camera make/model', 'Camera serial', 'Timestamps', 'Software',
+    'XMP', 'IPTC', 'Thumbnails', 'Color profile', 'Author and identity',
+    'Comments and descriptions', 'Other metadata'
+  ];
+
+  function categoriesFor(it) {
+    var tag = String(it.tag || '');
+    var group = String(it.group || '');
+    var source = String(it.source || '');
+    var blob = (tag + ' ' + group + ' ' + source).toLowerCase();
+    var tagLow = tag.toLowerCase();
+    var cats = [];
+    function add(name) { if (cats.indexOf(name) < 0) cats.push(name); }
+    if (it.sensitive === 'gps' || group === 'GPS' || group === 'Location' || /gps|latitude|longitude|iso6709/.test(tagLow)) add('GPS');
+    if (it.sensitive === 'serial' || /serial|uniqueid|imageunique/.test(tagLow)) add('Camera serial');
+    if (/^(make|model|lensmake|lensmodel|lensspecification|uniquecameramodel|cameramodelname)$/i.test(tag)) add('Camera make/model');
+    if (/date|time|timestamp|subsec|offsettime/.test(tagLow) || tagLow === 'year') add('Timestamps');
+    if (/^(software|creatortool|processingsoftware|encoder|history)$/i.test(tag) || tagLow.indexOf('software') >= 0) add('Software');
+    if (group === 'XMP' || /\bxmp\b/.test(blob) || tagLow === 'xmp') add('XMP');
+    if (group === 'IPTC' || /\biptc\b/.test(blob) || tagLow.indexOf('iptc') === 0) add('IPTC');
+    if (/thumb|preview|\bmpf\b|jpeginterchange/.test(blob)) add('Thumbnails');
+    if (/icc\b|color profile/.test(blob)) add('Color profile');
+    if (/^(artist|author|creator|copyright|owner|by-line|byline|credit|userid|username|initials|abspath|hostcomputer|rights)$/i.test(tag)) add('Author and identity');
+    if (/^(comment|usercomment|description|imagedescription|title|subject|keywords|keyword|caption|captionwriter|headline|objectname|xpcomment)$/i.test(tag)) add('Comments and descriptions');
+    if (!cats.length) add('Other metadata');
+    cats.sort(function (x, y) { return CATEGORY_ORDER.indexOf(x) - CATEGORY_ORDER.indexOf(y); });
+    return cats;
+  }
+
+  function fieldPhrase(it, verb) {
+    var tag = oneLine(it.tag, 80) || 'field';
+    var where = oneLine(it.source || '', 80);
+    return tag + ' ' + verb + (where ? ' (' + where + ')' : '');
+  }
+
+  function fieldKey(it) {
+    return oneLine(it.tag, 80) + '\0' + oneLine(it.group || '', 80) + '\0' + oneLine(it.source || '', 80);
+  }
+
+  /* before/after are matched on tag, group, and source. The value is never read. */
+  function removalSummary(beforeItems, afterItems) {
+    var before = [];
+    var after = [];
+    var seenB = Object.create(null);
+    var seenA = Object.create(null);
+    function take(list, dest, seen) {
+      if (!list) return;
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i];
+        if (!it || it.structural) continue;
+        var key = fieldKey(it);
+        if (seen[key]) continue;
+        seen[key] = 1;
+        dest.push(it);
+      }
+    }
+    take(beforeItems, before, seenB);
+    take(afterItems, after, seenA);
+    var removed = [];
+    var remaining = [];
+    var catRemoved = Object.create(null);
+    var catRemaining = Object.create(null);
+    for (var b = 0; b < before.length; b++) {
+      if (seenA[fieldKey(before[b])]) continue;
+      removed.push(fieldPhrase(before[b], 'removed'));
+      var cb = categoriesFor(before[b]);
+      for (var c = 0; c < cb.length; c++) catRemoved[cb[c]] = 1;
+    }
+    for (var a = 0; a < after.length; a++) {
+      remaining.push(fieldPhrase(after[a], 'still present'));
+      var ca = categoriesFor(after[a]);
+      for (var k = 0; k < ca.length; k++) catRemaining[ca[k]] = 1;
+    }
+    function ordered(map) {
+      var out = [];
+      for (var i = 0; i < CATEGORY_ORDER.length; i++) if (map[CATEGORY_ORDER[i]]) out.push(CATEGORY_ORDER[i]);
+      return out;
+    }
+    return {
+      categoriesRemoved: ordered(catRemoved),
+      categoriesRemaining: ordered(catRemaining),
+      fieldsRemoved: removed,
+      fieldsRemaining: remaining
+    };
+  }
+
+  function packOptions(options) {
+    options = options || {};
+    var when = options.generatedAt;
+    if (typeof when !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(when)) {
+      when = new Date().toISOString();
+    }
+    return {
+      neutralNames: !!options.neutralNames,
+      prefix: sanitizePrefix(options.prefix),
+      includeOriginalNames: !!options.includeOriginalNames,
+      includeOriginalHashes: !!options.includeOriginalHashes,
+      generatedAt: when,
+      forceJsHash: !!options.forceJsHash
+    };
+  }
+
+  function verdictLevel(level) {
+    if (level === 'clear' || level === 'residual' || level === 'unverified' || level === 'failed') return level;
+    return 'failed';
+  }
+
+  function csvSafe(value) {
+    var s = value == null ? '' : String(value);
+    /* A field name is attacker-controlled (a PNG text key, for example).
+       A cell that starts with = + - or @ would be a formula in a spreadsheet. */
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return s;
+  }
+
+  function csvCell(value) {
+    return '"' + csvSafe(value).replace(/"/g, '""') + '"';
+  }
+
+  function csvList(list) {
+    var out = [];
+    for (var i = 0; i < (list ? list.length : 0); i++) out.push(csvSafe(list[i]));
+    return out.join('; ');
+  }
+
+  function manifestCsv(manifest) {
+    var header = ['index', 'included', 'output_filename', 'sha256', 'format', 'format_id', 'support', 'method', 'verdict', 'categories_removed', 'categories_remaining', 'fields_removed', 'fields_remaining'];
+    if (manifest.originalFilenamesIncluded) header.push('original_filename');
+    if (manifest.originalHashesIncluded) header.push('original_sha256');
+    var lines = [header.map(csvCell).join(',')];
+    for (var i = 0; i < manifest.files.length; i++) {
+      var row = manifest.files[i];
+      var cells = [
+        row.index,
+        row.included ? 'yes' : 'no',
+        row.outputFilename || '',
+        row.sha256 || '',
+        row.format || '',
+        row.formatId || '',
+        row.support || '',
+        row.method || '',
+        row.verdict || '',
+        csvList(row.categoriesRemoved),
+        csvList(row.categoriesRemaining),
+        csvList(row.fieldsRemoved),
+        csvList(row.fieldsRemaining)
+      ];
+      if (manifest.originalFilenamesIncluded) cells.push(row.originalFilename || '');
+      if (manifest.originalHashesIncluded) cells.push(row.originalSha256 || '');
+      lines.push(cells.map(csvCell).join(','));
+    }
+    return '\uFEFF' + lines.join('\r\n') + '\r\n';
+  }
+
+  function pushFieldLines(lines, list) {
+    if (!list || !list.length) { lines.push('   - none'); return; }
+    for (var i = 0; i < list.length; i++) lines.push('   - ' + list[i]);
+  }
+
+  function manifestText(manifest) {
+    var lines = [];
+    lines.push('Exif Exorcist clean pack');
+    lines.push('');
+    lines.push('This file is a manifest of stripped outputs for a report appendix.');
+    lines.push('It lists metadata field names and categories. It does not list the values that were removed.');
+    lines.push('Original filenames are included only when the line below says yes. Folder paths are never included.');
+    lines.push('A hash of the original file is included only when the line below says yes.');
+    lines.push('"No metadata detected" means a second scan of a fully supported format found nothing this tool knows how to read.');
+    lines.push('Best-effort formats are not certified. A file that was not modified is listed and is not one of the outputs.');
+    lines.push('');
+    lines.push('Tool: Exif Exorcist ' + manifest.version);
+    lines.push('Generated: ' + manifest.generatedAt);
+    lines.push('Neutral filenames: ' + (manifest.neutralFilenames ? 'yes' : 'no'));
+    if (manifest.neutralFilenames) lines.push('Filename prefix: ' + manifest.filenamePrefix);
+    lines.push('Original filenames included: ' + (manifest.originalFilenamesIncluded ? 'yes' : 'no'));
+    lines.push('Original file hashes included: ' + (manifest.originalHashesIncluded ? 'yes' : 'no'));
+    lines.push('Outputs in this pack: ' + manifest.includedCount);
+    lines.push('Inputs not included: ' + (manifest.fileCount - manifest.includedCount));
+    lines.push('');
+    for (var i = 0; i < manifest.files.length; i++) {
+      var row = manifest.files[i];
+      lines.push(row.index + '. ' + (row.included ? row.outputFilename : '(not included)'));
+      lines.push('   Included: ' + (row.included ? 'yes' : 'no'));
+      lines.push('   SHA-256: ' + (row.sha256 || 'none'));
+      lines.push('   Format: ' + (row.format || 'Unknown'));
+      lines.push('   Support: ' + (row.support || 'unsupported'));
+      lines.push('   Method: ' + (row.method === 'canvas' ? 'canvas re-encode' : 'lossless'));
+      lines.push('   Result: ' + row.verdictTitle + '. ' + row.verdictDetail);
+      if (manifest.originalFilenamesIncluded) lines.push('   Original filename: ' + (row.originalFilename || 'none'));
+      if (manifest.originalHashesIncluded) lines.push('   Original SHA-256: ' + (row.originalSha256 || 'none'));
+      lines.push('   Categories removed: ' + (row.categoriesRemoved.length ? row.categoriesRemoved.join('; ') : 'none'));
+      lines.push('   Categories still present: ' + (row.categoriesRemaining.length ? row.categoriesRemaining.join('; ') : 'none'));
+      lines.push('   Fields removed:');
+      pushFieldLines(lines, row.fieldsRemoved);
+      lines.push('   Fields still present:');
+      pushFieldLines(lines, row.fieldsRemaining);
+      lines.push('');
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  async function cleanPack(records, options) {
+    var opt = packOptions(options);
+    records = records || [];
+    var includedTotal = 0;
+    for (var n = 0; n < records.length; n++) {
+      var rec = records[n];
+      if (rec && rec.ok && rec.outputBytes && typeof rec.outputBytes.length === 'number') includedTotal++;
+    }
+    var used = Object.create(null);
+    var seq = 0;
+    var rows = [];
+    var outputs = [];
+    for (var i = 0; i < records.length; i++) {
+      var record = records[i] || {};
+      var bytes = record.ok && record.outputBytes && typeof record.outputBytes.length === 'number' ? asBytes(record.outputBytes) : null;
+      var included = !!bytes;
+      var name = '';
+      if (included) {
+        seq++;
+        var raw = opt.neutralNames
+          ? neutralFilename(opt.prefix, seq, includedTotal, record.format)
+          : outputFilename(record.originalName, record.format);
+        name = uniqueZipName(raw, used);
+      }
+      var summary = removalSummary(record.beforeItems, record.afterItems);
+      var verdict = record.verdict || {};
+      var hash = included ? await sha256Hex(bytes, opt.forceJsHash) : null;
+      var formatId = oneLine(record.format, 40) || 'unknown';
+      var row = {
+        index: i + 1,
+        included: included,
+        outputFilename: included ? name : null,
+        sha256: hash,
+        format: oneLine(record.label, 80) || formatId,
+        formatId: formatId,
+        support: oneLine(record.support, 40) || 'unsupported',
+        method: record.method === 'canvas' ? 'canvas' : 'lossless',
+        verdict: verdictLevel(verdict.level),
+        verdictTitle: oneLine(verdict.title, 80) || 'Not stripped',
+        verdictDetail: oneLine(verdict.detail, 400) || 'The file was not modified.',
+        categoriesRemoved: summary.categoriesRemoved,
+        categoriesRemaining: summary.categoriesRemaining,
+        fieldsRemoved: summary.fieldsRemoved,
+        fieldsRemaining: summary.fieldsRemaining
+      };
+      if (opt.includeOriginalNames) row.originalFilename = fileBaseName(record.originalName) || 'untitled';
+      if (opt.includeOriginalHashes) {
+        row.originalSha256 = record.originalBytes && typeof record.originalBytes.length === 'number'
+          ? await sha256Hex(record.originalBytes, opt.forceJsHash)
+          : null;
+      }
+      rows.push(row);
+      if (included) outputs.push({ name: name, data: bytes });
+    }
+    var manifest = {
+      tool: 'Exif Exorcist',
+      version: P.VERSION,
+      generatedAt: opt.generatedAt,
+      note: 'Field names and categories only. Metadata values are not included. Original filenames and original-file hashes are included only when the flags below say so. Folder paths are not included.',
+      neutralFilenames: opt.neutralNames,
+      filenamePrefix: opt.neutralNames ? opt.prefix : null,
+      originalFilenamesIncluded: opt.includeOriginalNames,
+      originalHashesIncluded: opt.includeOriginalHashes,
+      fileCount: rows.length,
+      includedCount: outputs.length,
+      files: rows
+    };
+    var json = JSON.stringify(manifest, null, 2) + '\n';
+    var csv = manifestCsv(manifest);
+    var text = manifestText(manifest);
+    var enc = new TextEncoder();
+    var zip = writeZip(outputs.concat([
+      { name: 'manifest.json', data: enc.encode(json) },
+      { name: 'manifest.csv', data: enc.encode(csv) },
+      { name: 'manifest.txt', data: enc.encode(text) }
+    ]));
+    return { manifest: manifest, files: outputs, json: json, csv: csv, text: text, zip: zip };
+  }
+
+  async function processBatch(inputs, options) {
+    var opt = options || {};
+    var list = inputs || [];
+    var records = [];
+    for (var i = 0; i < list.length; i++) {
+      var input = list[i] || {};
+      var name = input.name || 'untitled';
+      var bytes = input.bytes;
+      if (!bytes || typeof bytes.length !== 'number') {
+        var missing = failResult('unknown', 'No file bytes were provided. The file was not modified.');
+        records.push({
+          originalName: name,
+          originalBytes: null,
+          outputBytes: null,
+          format: 'unknown',
+          label: 'Unknown',
+          support: 'unsupported',
+          verdict: judge(missing, null),
+          beforeItems: [],
+          afterItems: [],
+          ok: false,
+          method: 'lossless'
+        });
+        continue;
+      }
+      var before, stripped, after;
+      try {
+        before = await scan(bytes);
+        stripped = await stripLossless(bytes);
+        after = stripped.ok ? await scan(stripped.bytes) : before;
+      } catch (err) {
+        var why = err && err.message ? err.message : String(err);
+        stripped = failResult(before && before.detected ? before.detected.format : 'unknown', why + ' The file was not modified.');
+        if (!before) before = { detected: { format: 'unknown', label: 'Unknown', support: 'unsupported' }, items: [] };
+        after = before;
+      }
+      var detected = before.detected || {};
+      records.push({
+        originalName: name,
+        originalBytes: opt.includeOriginalHashes ? bytes : null,
+        outputBytes: stripped.ok ? stripped.bytes : null,
+        format: stripped.ok ? stripped.format : detected.format,
+        label: detected.label || '',
+        support: stripped.ok ? stripped.support : detected.support,
+        verdict: judge(stripped, after),
+        beforeItems: before.items || [],
+        afterItems: (after && after.items) || [],
+        ok: !!stripped.ok,
+        method: 'lossless'
+      });
+    }
+    return cleanPack(records, options);
+  }
+
   delete root.__exifExorcistParts;
   root.ExifExorcist = {
-    version: '1.0.0',
+    version: P.VERSION,
     detect: detect,
     detectSync: detectSync,
     scan: scan,
     stripLossless: stripLossless,
     judge: judge,
     writeZip: writeZip,
-    extensionFor: function (format) { return EXTENSIONS[format] || '.bin'; },
-    sensitivity: P.sensitivity
+    extensionFor: extensionFor,
+    sensitivity: P.sensitivity,
+    sha256Hex: sha256Hex,
+    sanitizePrefix: sanitizePrefix,
+    outputFilename: outputFilename,
+    cleanPack: cleanPack,
+    processBatch: processBatch
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);
