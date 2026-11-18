@@ -733,7 +733,7 @@ function buildPdf(objs) {
     [1, '<< /Type /Catalog /Pages 3 0 R /PieceInfo << /App << /LastModified (D:20240704133742Z) /Private << /Owner (Jane Doe) >> >> >> /AcroForm << /Fields [8 0 R] >> >>'],
     [2, '<< /Producer (Test) >>'],
     [3, '<< /Type /Pages /Kids [4 0 R] /Count 1 >>'],
-    [4, '<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R] /LastModified (D:20240704133742Z) >>'],
+    [4, '<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 5 0 R /Annots [6 0 R 7 0 R 8 0 R] /LastModified (D:20240704133742Z) >>'],
     [5, '<< /Length ' + content.length + ' >>\nstream\n' + content + '\nendstream'],
     [6, '<< /Type /Annot /Subtype /Text /Rect [100 100 120 120] /Contents (Please check this figure) /T (Jane Doe) /M (D:20240704133742Z) /CreationDate (D:20240704133742Z) /NM (annot-1234) /Popup 7 0 R >>'],
     [7, '<< /Type /Annot /Subtype /Popup /Rect [130 100 300 200] /Parent 6 0 R >>'],
@@ -753,8 +753,12 @@ function buildPdf(objs) {
   const outPath = join(work, 'out-annotations.pdf');
   writeFileSync(outPath, r.stripped.bytes);
   let qpdfOk = true;
-  try { execFileSync('qpdf', ['--check', outPath], { stdio: 'pipe' }); } catch (e) { qpdfOk = false; }
-  assert(qpdfOk, 'qpdf accepts the PDF after annotations are rewritten');
+  let qpdfErr = '';
+  try { execFileSync('qpdf', ['--check', outPath], { stdio: 'pipe' }); } catch (e) {
+    qpdfOk = false;
+    qpdfErr = String(e.stderr || e.stdout || e.message || '').trim();
+  }
+  assert(qpdfOk, 'qpdf accepts the PDF after annotations are rewritten' + (qpdfErr ? ': ' + qpdfErr : ''));
 
   // An attachment is part of the document. It is reported and it blocks a clear result.
   const withFile = buildPdf([
