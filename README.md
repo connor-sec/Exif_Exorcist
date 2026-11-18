@@ -12,6 +12,8 @@ Maintained by [@connor-sec](https://github.com/connor-sec).
 
 Open `Exif-Exorcist-v1.0.html` in any modern browser. That's it — no install, no server. It also works from a `file://` URL.
 
+To prepare a folder of photos for a report, choose the folder, strip, then download a clean pack. The pack is a zip of the stripped files and a manifest. [Clean pack](#clean-pack) describes what that zip contains and what it leaves out.
+
 ## ⚠️ Authorized use only — and what this tool will not promise
 
 **Authorized use.** Exif Exorcist rewrites files you choose and keeps the work in your browser. It does not upload them. Use it only on files you are allowed to modify. Stripping metadata from a file you do not have rights to, or removing metadata you are required to keep, may violate law, contract, or policy.
@@ -33,7 +35,33 @@ Open `Exif-Exorcist-v1.0.html` in any modern browser. That's it — no install, 
 * **Lossless stripping by removing the container,** not by re-encoding the picture. JPEG segments, PNG chunks, WebP chunks, GIF extensions, TIFF tags, PDF Info/XMP, Office properties, ODF `meta.xml`, ID3/APE, and QuickTime user-data atoms.
 * **An optional canvas re-encode for images,** with the quality loss stated next to the control: a new PNG, first frame only, color and bit depth can change.
 * **A before/after report from a fresh scan of the output.** The page does not call a file clean when that scan still finds metadata.
-* **Download one file, or all of them as a zip.** The zip writer is in the page. Nothing is fetched to build it.
+* **Download one file, or all of them as a zip.** The zip writer is in the page. Nothing is fetched to build it. Those names keep the original file name plus `-stripped`.
+* **Choose a folder.** The file list already takes several files at once. **Choose a folder** adds every file the browser lists, including files in subfolders.
+* **Clean pack.** After a strip, download a zip of the outputs plus a JSON, CSV, and plain-text manifest. Output names can be a prefix and a sequence number. The manifest records field names that were removed, not the values.
+
+## Clean pack
+
+A clean pack is the zip you attach to a report: the stripped files, plus a manifest of what was removed.
+
+1. Drop the files, or use **Choose a folder**. The page reads them locally. A dropped folder is read in the browser, including subfolders when the browser allows it.
+2. Strip and re-scan. The pack is built from that result. Files you add after the strip are left out until you strip again.
+3. Leave **Neutral filenames** on unless the zip should keep the original file names. Outputs are then `photo-001.jpg`, `photo-002.jpg`, and so on. The prefix is whatever you type, reduced to letters, digits, hyphens, and underscores, up to 40 characters. An empty prefix becomes `photo`. The sequence counts outputs, so a file that could not be stripped does not take a number.
+4. **Download clean pack.** The zip contains the outputs and three copies of the same manifest: `manifest.json`, `manifest.csv`, and `manifest.txt`. The text file is written so it can sit in an appendix. The CSV is UTF-8 with a byte-order mark so a spreadsheet reads the field names as Unicode.
+
+For each file the manifest lists the output filename, the SHA-256 of the cleaned bytes, the format, the re-scan result, and the metadata categories and field names that were removed or are still present. A removed GPS field is recorded as `GPSLatitude removed`, not as the coordinate that was stored there. Values are not written into the manifest.
+
+Two boxes are off unless you turn them on:
+
+* **Original filenames.** Adds the file's own name. The folder it came from is not included, and it is not included unless this box is on.
+* **SHA-256 of the original file.** Adds a hash of the bytes you dropped. The original bytes are not put in the zip.
+
+If neutral filenames are off, the output filename itself still carries the original name. The checkbox only controls the extra manifest column.
+
+The hash is SHA-256. The page uses Web Crypto (`crypto.subtle`) when the browser provides it. Opening the file from a `file://` URL is not a secure context in every browser, and those browsers hide Web Crypto; the page then uses a SHA-256 implementation that ships in the file. Both are checked against the same test vectors. Nothing is fetched to compute a hash.
+
+Files that could not be stripped are listed in the manifest and left out of the outputs. Best-effort formats are still not certified. **Download** and **Download zip** are unchanged: those names still use the original file name plus `-stripped`.
+
+The page still shows metadata values on screen while you review a file. That list stays in the browser. It is not copied into the pack.
 
 ## Supported formats
 
@@ -60,7 +88,8 @@ AVIF, BigTIFF, encrypted PDF, ZIP64, and ZIP files that are not Office or ODF pa
 * ICC profiles are removed. Colors can shift. The Adobe JPEG APP14 marker is kept so CMYK files still decode.
 * A Word document that talks about GPS in its own paragraph still contains that sentence. If the text contains a marker such as `GPSLatitude`, the re-scan says metadata remains.
 * Canvas re-encode is a different file. It is the right tool when you accept quality loss. It is the wrong tool when you need the original encoding.
-* This page does not remove faces, plates, screens, or filenames.
+* This page does not remove faces, plates, or screens. The files on disk keep their names. A clean pack can give the downloaded copies neutral filenames. Text that is visible in the picture stays.
+* The manifest is not a certification. It records the field names this tool's scan could read. Check the outputs with ExifTool before you rely on them.
 * Verify with ExifTool before you rely on a result.
 
 ## Development

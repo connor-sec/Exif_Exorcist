@@ -10,6 +10,14 @@
   var empty = document.getElementById('empty');
   var stripBtn = document.getElementById('strip');
   var zipBtn = document.getElementById('zip');
+  var cleanPackBtn = document.getElementById('clean-pack');
+  var folderBtn = document.getElementById('pick-folder');
+  var folderInput = document.getElementById('folder-input');
+  var neutralBox = document.getElementById('neutral-names');
+  var prefixInput = document.getElementById('name-prefix');
+  var namesBox = document.getElementById('manifest-names');
+  var originalHashBox = document.getElementById('manifest-original-hash');
+  var packNote = document.getElementById('pack-note');
   var status = document.getElementById('status');
   var summary = document.getElementById('summary');
   var modeNote = document.getElementById('mode-note');
@@ -36,6 +44,20 @@
   });
   describeMode();
 
+  function syncPackNote() {
+    var neutral = neutralBox.checked;
+    prefixInput.disabled = !neutral;
+    if (neutral) {
+      var prefix = EE.sanitizePrefix(prefixInput.value);
+      packNote.textContent = 'Outputs are named ' + prefix + '-001, ' + prefix + '-002, and so on. Original filenames are left out of the manifest unless you opt in. Folder paths are never written.';
+    } else {
+      packNote.textContent = 'Neutral names are off. Each output keeps its original file name plus -stripped, so that name is in the zip. The manifest lists it in its own column only if you opt in.';
+    }
+  }
+  neutralBox.addEventListener('change', syncPackNote);
+  prefixInput.addEventListener('input', syncPackNote);
+  syncPackNote();
+
   drop.addEventListener('click', function () { picker.click(); });
   drop.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter' || ev.key === ' ') {
@@ -56,12 +78,73 @@
     });
   });
   drop.addEventListener('drop', function (ev) {
-    takeFiles(ev.dataTransfer.files);
+    if (canWalkItems(ev.dataTransfer && ev.dataTransfer.items)) readDropItems(ev.dataTransfer.items);
+    else takeFiles(ev.dataTransfer.files);
+  });
+  folderBtn.addEventListener('click', function () { folderInput.click(); });
+  folderInput.addEventListener('change', function () {
+    takeFiles(folderInput.files);
+    folderInput.value = '';
   });
   picker.addEventListener('change', function () {
     takeFiles(picker.files);
     picker.value = '';
   });
+
+  function canWalkItems(items) {
+    if (!items || !items.length) return false;
+    for (var i = 0; i < items.length; i++) if (items[i].webkitGetAsEntry) return true;
+    return false;
+  }
+
+  /* A dropped folder is a directory entry. dataTransfer.files does not list
+     the files inside it. Read the tree locally. Names stored later are the
+     file's own name, never the relative folder path. */
+  function readDropItems(itemList) {
+    var collected = [];
+    var tasks = [];
+    function readAll(reader) {
+      var all = [];
+      function read() {
+        return new Promise(function (resolve, reject) { reader.readEntries(resolve, reject); }).then(function (batch) {
+          if (!batch.length) return all;
+          for (var i = 0; i < batch.length; i++) all.push(batch[i]);
+          return read();
+        });
+      }
+      return read();
+    }
+    function walk(entry) {
+      if (!entry) return Promise.resolve();
+      if (entry.isFile) {
+        return new Promise(function (resolve) {
+          entry.file(function (file) { collected.push(file); resolve(); }, function () { resolve(); });
+        });
+      }
+      if (entry.isDirectory && entry.createReader) {
+        return readAll(entry.createReader()).then(function (entries) {
+          return Promise.all(entries.map(walk));
+        });
+      }
+      return Promise.resolve();
+    }
+    setStatus('Reading dropped files.');
+    for (var i = 0; i < itemList.length; i++) {
+      var entry = itemList[i].webkitGetAsEntry && itemList[i].webkitGetAsEntry();
+      if (entry) tasks.push(walk(entry));
+      else if (itemList[i].getAsFile) {
+        var file = itemList[i].getAsFile();
+        if (file) collected.push(file);
+      }
+    }
+    Promise.all(tasks).then(function () {
+      if (!collected.length) { setStatus('No files found.'); return; }
+      takeFiles(collected);
+    }, function () {
+      setStatus('Could not read that folder.');
+      if (collected.length) takeFiles(collected);
+    });
+  }
 
   function takeFiles(listLike) {
     var incoming = Array.prototype.slice.call(listLike || []);
@@ -131,15 +214,20 @@
       });
     });
     setStatus(files.length + ' file' + (files.length === 1 ? '' : 's') + ' scanned. ' + gps + ' GPS field' + (gps === 1 ? '' : 's') + ', ' + serial + ' serial field' + (serial === 1 ? '' : 's') + '.');
-    stripBtn.disabled = busy || files.length === 0;
+    refreshActions();
     if (!busy) stripBtn.focus();
+  }
+
+  function refreshActions() {
+    stripBtn.disabled = busy || files.length === 0;
+    zipBtn.disabled = busy || !files.some(function (f) { return f.result && f.result.bytes; });
+    cleanPackBtn.disabled = busy || !files.some(function (f) { return f.result; });
   }
 
   stripBtn.addEventListener('click', async function () {
     if (busy) return;
     busy = true;
-    stripBtn.disabled = true;
-    zipBtn.disabled = true;
+    refreshActions();
     var useCanvas = mode() === 'canvas';
     /* A snapshot again, and every exit re-enables the button. Before, a file
        dropped in mid-run had no result yet, the summary loop threw on it, and
@@ -153,7 +241,7 @@
         } catch (err) {
           var reason = 'Stripping stopped with an error (' + (err && err.message ? err.message : String(err)) + '). The original file was not modified.';
           var failed = { ok: false, format: 'unknown', support: 'unsupported', bytes: null, notes: [], blocksClear: true, reason: reason };
-          batch[i].result = { stripped: failed, after: batch[i].before, verdict: EE.judge(failed, batch[i].before), downloadName: null, bytes: null };
+          batch[i].result = { stripped: failed, after: batch[i].before, verdict: EE.judge(failed, batch[i].before), downloadName: null, bytes: null, method: useCanvas ? 'canvas' : 'lossless' };
         }
       }
       render();
@@ -171,8 +259,7 @@
       summary.textContent = line;
     } finally {
       busy = false;
-      stripBtn.disabled = files.length === 0;
-      zipBtn.disabled = !files.some(function (f) { return f.result && f.result.bytes; });
+      refreshActions();
     }
     var first = document.querySelector('.verdict');
     if (first) first.focus();
@@ -198,10 +285,10 @@
           blocksClear: false,
           changed: true
         };
-        return { stripped: stripped, after: after, verdict: EE.judge(stripped, after), downloadName: downloadName(file.name, 'png'), bytes: png };
+        return { stripped: stripped, after: after, verdict: EE.judge(stripped, after), downloadName: downloadName(file.name, 'png'), bytes: png, method: 'canvas' };
       } catch (err) {
         var failed = { ok: false, format: detected.format, support: detected.support, bytes: null, notes: [], blocksClear: true, reason: 'The browser could not decode this image for canvas re-encode (' + err.message + '). The original file was not modified.' };
-        return { stripped: failed, after: file.before, verdict: EE.judge(failed, file.before), downloadName: null, bytes: null };
+        return { stripped: failed, after: file.before, verdict: EE.judge(failed, file.before), downloadName: null, bytes: null, method: 'canvas' };
       }
     }
     var strippedLossless = await EE.stripLossless(file.bytes);
@@ -211,7 +298,8 @@
       after: afterScan,
       verdict: EE.judge(strippedLossless, afterScan),
       downloadName: strippedLossless.ok ? downloadName(file.name, strippedLossless.format) : null,
-      bytes: strippedLossless.ok ? strippedLossless.bytes : null
+      bytes: strippedLossless.ok ? strippedLossless.bytes : null,
+      method: 'lossless'
     };
   }
 
@@ -254,6 +342,52 @@
     setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
   }
 
+  cleanPackBtn.addEventListener('click', async function () {
+    if (busy) return;
+    var ready = files.filter(function (f) { return f.result; });
+    if (!ready.length) return;
+    busy = true;
+    refreshActions();
+    setStatus('Building the clean pack.');
+    try {
+      var includeHash = originalHashBox.checked;
+      var records = ready.map(function (f) {
+        var stripped = f.result.stripped || {};
+        var ok = !!(f.result.bytes && stripped.ok);
+        var detected = f.detected || {};
+        return {
+          originalName: f.name,
+          originalBytes: includeHash ? f.bytes : null,
+          outputBytes: ok ? f.result.bytes : null,
+          format: ok ? stripped.format : detected.format,
+          label: detected.label || '',
+          support: ok ? stripped.support : detected.support,
+          verdict: f.result.verdict,
+          beforeItems: f.before && f.before.items ? f.before.items : [],
+          afterItems: f.result.after && f.result.after.items ? f.result.after.items : [],
+          ok: ok,
+          method: f.result.method === 'canvas' ? 'canvas' : 'lossless'
+        };
+      });
+      var pack = await EE.cleanPack(records, {
+        neutralNames: neutralBox.checked,
+        prefix: prefixInput.value,
+        includeOriginalNames: namesBox.checked,
+        includeOriginalHashes: includeHash
+      });
+      downloadBytes('exif-exorcist-clean-pack.zip', pack.zip, 'application/zip');
+      var pending = files.length - ready.length;
+      var line = 'Clean pack downloaded. ' + pack.files.length + ' output file' + (pack.files.length === 1 ? '' : 's') + ', with a JSON, CSV, and text manifest.';
+      if (pending) line += ' ' + pending + ' file' + (pending === 1 ? ' has' : 's have') + ' not been stripped yet and ' + (pending === 1 ? 'was' : 'were') + ' left out.';
+      setStatus(line);
+    } catch (err) {
+      setStatus('Could not build the clean pack (' + (err && err.message ? err.message : String(err)) + ').');
+    } finally {
+      busy = false;
+      refreshActions();
+    }
+  });
+
   zipBtn.addEventListener('click', function () {
     var entries = [];
     var used = {};
@@ -281,8 +415,8 @@
   function render() {
     list.textContent = '';
     empty.hidden = files.length !== 0;
-    stripBtn.disabled = busy || files.length === 0;
     files.forEach(function (file) { list.appendChild(card(file)); });
+    refreshActions();
   }
 
   function card(file) {
@@ -343,7 +477,6 @@
     remove.addEventListener('click', function () {
       files = files.filter(function (f) { return f.id !== file.id; });
       render();
-      zipBtn.disabled = !files.some(function (f) { return f.result && f.result.bytes; });
       if (!files.length) summary.textContent = '';
     });
     art.appendChild(remove);

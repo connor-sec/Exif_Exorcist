@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join } from 'path';
@@ -31,6 +32,11 @@ assert(!/<link\b[^>]*\bhref=/i.test(html), 'no external stylesheets');
 assert(!/https?:\/\//.test(html.split('<script>')[0].split('</style>')[0] || ''), 'head has no network URLs');
 assert(html.includes('Canvas re-encode'), 'canvas warning is in the page');
 assert(html.includes('quality can drop'), 'quality-loss warning is explicit');
+assert(html.includes('id="clean-pack"'), 'clean pack download is on the page');
+assert(html.includes('id="pick-folder"'), 'folder picker is on the page');
+assert(html.includes('webkitdirectory'), 'folder input can select a directory');
+assert(html.includes('Neutral filenames'), 'neutral filename control is on the page');
+assert(html.includes('not the values that were stored'), 'the page says the manifest omits metadata values');
 
 const work = mkdtempSync(join(tmpdir(), 'exif-exorcist-'));
 execFileSync('python3', [join(root, 'tests/generate_samples.py'), work], { stdio: 'inherit' });
@@ -351,6 +357,212 @@ const DOC_XML = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordproc
   assert(r.stripped.ok && !str(r.stripped.bytes).includes('ABCD'), 'unrecognized WebP chunk is removed');
   writeFileSync(join(work, 'extra.webp'), r.stripped.bytes);
   execFileSync('python3', ['-c', 'from PIL import Image; Image.open(' + JSON.stringify(join(work, 'extra.webp')) + ').load()']);
+}
+
+{ // Clean pack: neutral names, a value-free manifest, and hashes of the output bytes.
+  function nodeSha(bytes) {
+    return createHash('sha256').update(bytes).digest('hex');
+  }
+  async function agree(bytes) {
+    const viaSubtle = await EE.sha256Hex(bytes);
+    const viaJs = await EE.sha256Hex(bytes, true);
+    const viaNode = nodeSha(bytes);
+    assert(viaSubtle === viaNode && viaJs === viaNode, 'sha256 mismatch ' + viaSubtle + ' ' + viaJs + ' ' + viaNode);
+    return viaNode;
+  }
+  assert(await agree(new Uint8Array(0)) === 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', 'sha256 of empty input');
+  assert(await agree(Buffer.from('abc')) === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'sha256 of abc');
+  assert(await agree(Buffer.from('abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq')) === '248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1', 'sha256 of the long test vector');
+  await agree(Buffer.alloc(56, 0x61));
+  await agree(Buffer.alloc(64, 0x61));
+  await agree(Buffer.alloc(1000, 0x62));
+  {
+    const subtle = globalThis.crypto.subtle;
+    const original = subtle.digest;
+    let calls = 0;
+    subtle.digest = function (alg, data) {
+      calls++;
+      return original.call(this, alg, data);
+    };
+    const hex = await EE.sha256Hex(Buffer.from('abc'));
+    subtle.digest = original;
+    assert(calls === 1 && hex.startsWith('ba7816bf'), 'manifest hashing goes through crypto.subtle when it is available');
+  }
+
+  assert(EE.sanitizePrefix('../Client Site') === 'Client-Site', 'prefix drops the directory and keeps the token');
+  assert(EE.sanitizePrefix('..') === 'photo' && EE.sanitizePrefix('') === 'photo' && EE.sanitizePrefix('///') === 'photo', 'empty and dotted prefixes become photo');
+  assert(EE.sanitizePrefix('a/../../etc') === 'etc', 'prefix keeps only the last path segment');
+  assert(EE.sanitizePrefix('a'.repeat(80)).length <= 40 && !EE.sanitizePrefix('folder/name').includes('/'), 'prefix is short and has no slash');
+  assert(EE.outputFilename('photo.jpg', 'jpeg') === 'photo-stripped.jpg', 'plain stripped name');
+  assert(EE.outputFilename('photo.jpg', 'png') === 'photo-stripped.png', 'extension follows the format that was written');
+  assert(EE.outputFilename('dir/photo.jpg', 'jpeg') === 'photo-stripped.jpg', 'stripped name drops directories');
+  assert(EE.outputFilename('..\\..\\secret.jpg', 'jpeg') === 'secret-stripped.jpg', 'stripped name cannot escape the zip');
+
+  const planted = [
+    { tag: 'GPSLatitude', value: '37 deg SECRET-COORD', group: 'GPS', source: 'JPEG APP1 EXIF', sensitive: 'gps' },
+    { tag: 'Make', value: 'SECRET-MAKE', group: 'IFD0', source: 'JPEG APP1 EXIF' },
+    { tag: 'BodySerialNumber', value: 'SECRET-SN', group: 'Exif', source: 'JPEG APP1 EXIF', sensitive: 'serial' },
+    { tag: 'DateTimeOriginal', value: 'SECRET-DATE', group: 'Exif', source: 'JPEG APP1 EXIF' },
+    { tag: 'Software', value: 'SECRET-APP', group: 'IFD0', source: 'JPEG APP1 EXIF' },
+    { tag: 'CreatorTool', value: 'SECRET-XMP', group: 'XMP', source: 'JPEG APP1 XMP' },
+    { tag: 'By-line', value: 'SECRET-BY', group: 'IPTC', source: 'JPEG APP13' },
+    { tag: 'MPF', value: 'SECRET-THUMB', group: 'JPEG', source: 'JPEG APP2' },
+    { tag: 'ICC profile', value: 'SECRET-ICC', group: 'JPEG', source: 'JPEG APP2' },
+    { tag: '=cmd|calc', value: 'SECRET-FORMULA', group: 'PNG', source: 'PNG tEXt' }
+  ];
+  const secrets = planted.map((item) => item.value);
+  const output = Uint8Array.of(1, 2, 3, 4, 5);
+  const original = Uint8Array.of(9, 8, 7, 6);
+  const synthetic = await EE.cleanPack([
+    {
+      originalName: 'Client Folder/DCIM/IMG_2041.JPG',
+      originalBytes: original,
+      outputBytes: output,
+      ok: true,
+      format: 'jpeg',
+      label: 'JPEG',
+      support: 'full',
+      method: 'lossless',
+      verdict: { level: 'clear', title: 'No metadata detected', detail: 'Re-scan found no metadata.' },
+      beforeItems: planted,
+      afterItems: []
+    },
+    {
+      originalName: 'shot.jpg',
+      outputBytes: null,
+      ok: false,
+      format: 'bigtiff',
+      label: 'BigTIFF',
+      support: 'unsupported',
+      method: 'lossless',
+      verdict: { level: 'failed', title: 'Not stripped', detail: 'BigTIFF is not supported. The file was not modified.' },
+      beforeItems: [],
+      afterItems: []
+    }
+  ], {
+    neutralNames: true,
+    prefix: '../Client Site',
+    includeOriginalNames: false,
+    includeOriginalHashes: false,
+    forceJsHash: true,
+    generatedAt: '2026-11-18T00:00:00.000Z'
+  });
+  const manifestBlob = synthetic.json + '\n' + synthetic.csv + '\n' + synthetic.text;
+  for (const secret of secrets) assert(!manifestBlob.includes(secret), 'manifest contains a metadata value: ' + secret);
+  assert(!manifestBlob.includes('IMG_2041') && !manifestBlob.includes('Client Folder') && !manifestBlob.includes('DCIM') && !manifestBlob.includes('shot.jpg'), 'original names are omitted unless opted in');
+  assert(!synthetic.manifest.files.some((row) => Object.prototype.hasOwnProperty.call(row, 'originalFilename') || Object.prototype.hasOwnProperty.call(row, 'originalSha256')), 'opt-in fields are omitted from each row by default');
+  assert(!/"originalFilename"/.test(synthetic.json) && !/"originalSha256"/.test(synthetic.json), 'opt-in keys are absent from the JSON');
+  assert(!synthetic.csv.includes('original_filename') && !synthetic.csv.includes('original_sha256'), 'opt-in columns are absent from the CSV');
+  assert(!synthetic.text.includes('Original filename:') && !synthetic.text.includes('Original SHA-256:'), 'opt-in lines are absent from the text');
+  assert(!/"value"\s*:/.test(synthetic.json), 'manifest JSON has no value field');
+  assert(synthetic.manifest.version === '1.0.0' && synthetic.manifest.version === EE.version, 'manifest records the tool version');
+  assert(synthetic.manifest.generatedAt === '2026-11-18T00:00:00.000Z', 'manifest records the generation time');
+  assert(synthetic.manifest.neutralFilenames === true && synthetic.manifest.filenamePrefix === 'Client-Site', 'prefix is the sanitized token');
+  assert(synthetic.manifest.files[0].outputFilename === 'Client-Site-001.jpg', 'neutral name is prefix, sequence, and format extension');
+  assert(synthetic.manifest.files[0].sha256 === nodeSha(output), 'manifest hash matches the output bytes');
+  assert(synthetic.manifest.files[1].included === false && synthetic.manifest.files[1].sha256 === null && synthetic.manifest.files[1].verdict === 'failed', 'a file that was not stripped is listed and not given an output hash');
+  for (const category of ['GPS', 'Camera make/model', 'Camera serial', 'Timestamps', 'Software', 'XMP', 'IPTC', 'Thumbnails', 'Color profile', 'Author and identity']) {
+    assert(synthetic.manifest.files[0].categoriesRemoved.includes(category), 'missing category ' + category);
+  }
+  assert(synthetic.text.includes('GPSLatitude removed (JPEG APP1 EXIF)'), 'field line names the field and not its value');
+  assert(synthetic.text.includes('Exif Exorcist 1.0.0') && synthetic.text.includes('Generated: 2026-11-18T00:00:00.000Z'), 'text manifest has version and time');
+  assert(synthetic.csv.charCodeAt(0) === 0xFEFF, 'CSV is UTF-8 with a byte-order mark');
+  assert(synthetic.csv.includes("'=cmd|calc removed (PNG tEXt)"), 'CSV neutralizes a field name that would be a spreadsheet formula');
+  const syntheticZip = join(work, 'synthetic-pack.zip');
+  writeFileSync(syntheticZip, synthetic.zip);
+  const syntheticNames = execFileSync('python3', ['-c', 'import sys,zipfile; print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))', syntheticZip], { encoding: 'utf8' }).trim().split('\n');
+  assert(syntheticNames.join(',') === 'Client-Site-001.jpg,manifest.json,manifest.csv,manifest.txt', 'zip entries are the output plus the three manifests, got ' + syntheticNames.join(','));
+  assert(syntheticNames.every((name) => !name.includes('/') && !name.includes('\\') && !name.includes('..')), 'zip entries have no path');
+  const zippedOutput = execFileSync('unzip', ['-p', syntheticZip, 'Client-Site-001.jpg']);
+  assert(Buffer.compare(zippedOutput, Buffer.from(output)) === 0, 'zip stores the cleaned bytes');
+  assert(nodeSha(zippedOutput) === synthetic.manifest.files[0].sha256, 'hash matches the bytes stored in the zip');
+  assert(execFileSync('unzip', ['-p', syntheticZip, 'manifest.json'], { encoding: 'utf8' }) === synthetic.json, 'zip stores the JSON manifest');
+
+  const opted = await EE.cleanPack([
+    {
+      originalName: 'Client Folder/DCIM/IMG_2041.JPG',
+      originalBytes: original,
+      outputBytes: output,
+      ok: true,
+      format: 'jpeg',
+      label: 'JPEG',
+      support: 'full',
+      verdict: { level: 'clear', title: 'No metadata detected', detail: 'Re-scan found no metadata.' },
+      beforeItems: planted,
+      afterItems: []
+    },
+    {
+      originalName: 'shot.jpg',
+      outputBytes: output,
+      ok: true,
+      format: 'jpeg',
+      label: 'JPEG',
+      support: 'full',
+      verdict: { level: 'clear', title: 'No metadata detected', detail: 'Re-scan found no metadata.' },
+      beforeItems: [],
+      afterItems: []
+    }
+  ], {
+    neutralNames: false,
+    prefix: 'SECRETPREFIX',
+    includeOriginalNames: true,
+    includeOriginalHashes: true,
+    generatedAt: '2026-11-18T00:00:00.000Z'
+  });
+  const optedBlob = opted.json + '\n' + opted.csv + '\n' + opted.text;
+  for (const secret of secrets) assert(!optedBlob.includes(secret), 'opt-in manifest still contains a metadata value: ' + secret);
+  assert(!optedBlob.includes('SECRETPREFIX') && !optedBlob.includes('Client Folder') && !optedBlob.includes('DCIM'), 'opt-in keeps the file name and drops the folder and the unused prefix');
+  assert(opted.manifest.filenamePrefix === null && opted.manifest.neutralFilenames === false, 'neutral names off does not publish a prefix');
+  assert(opted.manifest.files[0].outputFilename === 'IMG_2041-stripped.jpg', 'without neutral names the output keeps the file stem');
+  assert(opted.manifest.files[1].outputFilename === 'shot-stripped.jpg', 'second file keeps its own stem');
+  assert(opted.manifest.files[0].originalFilename === 'IMG_2041.JPG', 'opt-in records the file name only');
+  assert(opted.manifest.files[0].originalSha256 === nodeSha(original), 'opt-in original hash matches the original bytes');
+  assert(opted.csv.includes('original_filename') && opted.csv.includes('original_sha256'), 'CSV gains the opt-in columns');
+  assert(opted.text.includes('Original filename: IMG_2041.JPG') && opted.text.includes('Original SHA-256: ' + nodeSha(original)), 'text manifest shows the opt-in lines');
+
+  const collided = await EE.cleanPack([
+    { originalName: 'shot.jpg', outputBytes: Uint8Array.of(1), ok: true, format: 'jpeg', label: 'JPEG', support: 'full', verdict: { level: 'clear', title: 'No metadata detected', detail: 'Re-scan found no metadata.' }, beforeItems: [], afterItems: [] },
+    { originalName: 'shot.jpg', outputBytes: Uint8Array.of(2), ok: true, format: 'jpeg', label: 'JPEG', support: 'full', verdict: { level: 'clear', title: 'No metadata detected', detail: 'Re-scan found no metadata.' }, beforeItems: [], afterItems: [] }
+  ], { neutralNames: false, generatedAt: '2026-11-18T00:00:00.000Z' });
+  assert(collided.manifest.files[0].outputFilename === 'shot-stripped.jpg' && collided.manifest.files[1].outputFilename === 'shot-stripped-2.jpg', 'duplicate output names get a suffix');
+
+  const batch = await EE.processBatch([
+    { name: 'sample.jpg', bytes: read('sample.jpg') },
+    { name: 'LEAKED-ORIGINAL-NAME.tif', bytes: read('sample.bigtiff') },
+    { name: 'sample.png', bytes: read('sample.png') }
+  ], {
+    neutralNames: true,
+    prefix: 'site',
+    includeOriginalNames: false,
+    includeOriginalHashes: false,
+    generatedAt: '2026-11-18T03:04:05.000Z'
+  });
+  assert(batch.manifest.fileCount === 3 && batch.manifest.includedCount === 2, 'batch keeps going after a file that cannot be stripped');
+  assert(batch.manifest.files[0].outputFilename === 'site-001.jpg' && batch.manifest.files[0].verdict === 'clear', 'first output is the stripped jpeg');
+  assert(batch.manifest.files[1].included === false && batch.manifest.files[1].verdict === 'failed' && batch.manifest.files[1].outputFilename === null, 'BigTIFF is reported and not packed');
+  assert(batch.manifest.files[2].outputFilename === 'site-002.png' && batch.manifest.files[2].verdict === 'clear', 'sequence numbers count outputs, so the png is 002');
+  const batchBlob = batch.json + '\n' + batch.csv + '\n' + batch.text;
+  assert(!batchBlob.includes('LEAKED-ORIGINAL-NAME') && !batchBlob.includes('sample.jpg') && !batchBlob.includes('sample.png'), 'batch manifest does not repeat the original names');
+  assert(!batchBlob.includes(nodeSha(read('sample.jpg'))), 'original jpeg hash is not written unless opted in');
+  const scanned = await EE.scan(read('sample.jpg'));
+  for (const item of scanned.items) {
+    if (item.value && item.value.length >= 6) assert(!batchBlob.includes(item.value), 'real metadata value leaked into the manifest: ' + item.tag);
+  }
+  assert(batch.manifest.files[0].categoriesRemoved.includes('GPS'), 'jpeg pack records GPS as removed');
+  assert(batch.text.includes('GPSLatitude removed'), 'jpeg pack names the GPS field that was removed');
+  assert(batch.manifest.files[0].fieldsRemaining.length === 0, 'clear jpeg has no remaining fields in the manifest');
+  const batchZip = join(work, 'batch-pack.zip');
+  writeFileSync(batchZip, batch.zip);
+  const batchNames = execFileSync('python3', ['-c', 'import sys,zipfile; print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))', batchZip], { encoding: 'utf8' }).trim().split('\n');
+  assert(batchNames.join(',') === 'site-001.jpg,site-002.png,manifest.json,manifest.csv,manifest.txt', 'batch zip contents ' + batchNames.join(','));
+  const packedJpeg = execFileSync('unzip', ['-p', batchZip, 'site-001.jpg']);
+  const strippedJpeg = await EE.stripLossless(read('sample.jpg'));
+  assert(Buffer.compare(packedJpeg, Buffer.from(strippedJpeg.bytes)) === 0, 'batch output is the stripped jpeg');
+  assert(nodeSha(packedJpeg) === batch.manifest.files[0].sha256, 'batch manifest hash matches the jpeg bytes in the zip');
+  assert(await EE.sha256Hex(packedJpeg) === batch.manifest.files[0].sha256, 'Web Crypto hash matches the jpeg bytes in the zip');
+  assert(await EE.sha256Hex(packedJpeg, true) === batch.manifest.files[0].sha256, 'built-in hash matches the jpeg bytes in the zip');
+  const packedPng = execFileSync('unzip', ['-p', batchZip, 'site-002.png']);
+  assert(nodeSha(packedPng) === batch.manifest.files[2].sha256, 'batch manifest hash matches the png bytes in the zip');
 }
 
 rmSync(work, { recursive: true, force: true });

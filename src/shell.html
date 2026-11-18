@@ -155,6 +155,20 @@ tr.serial { background: var(--serial-bg); }
 .none { color: var(--muted); }
 details.formats { padding: 12px 16px; margin-top: 18px; }
 details.formats table { margin-top: 8px; }
+.folder-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+.folder-row span, #pack-help, #pack-note { color: var(--muted); }
+#pack-help, #pack-note { margin: 8px 0 0; }
+.prefix-line { display: flex; gap: 10px; align-items: center; margin: 8px 0 8px 1.6rem; color: var(--muted); }
+.prefix-line input {
+  background: var(--surface-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  width: 12rem;
+}
+.prefix-line input:disabled { opacity: 0.45; }
 footer { margin-top: 28px; color: var(--muted); font-size: 0.9rem; }
 footer a { color: var(--accent); }
 .sr {
@@ -185,9 +199,14 @@ footer a { color: var(--accent); }
   <h2 id="add-heading" class="sr">Add files</h2>
   <button type="button" class="drop" id="drop" aria-describedby="drop-help">
     <strong>Drop files here</strong>
-    <span id="drop-help">or press Enter to choose files. Several at once is fine. The type comes from the bytes, not the extension.</span>
+    <span id="drop-help">or press Enter to choose files. Several at once is fine, or choose a folder below. The type comes from the bytes, not the extension.</span>
   </button>
   <input id="file-input" class="sr" type="file" multiple aria-label="Choose files">
+  <div class="folder-row">
+    <button type="button" id="pick-folder" class="secondary">Choose a folder</button>
+    <span id="folder-help">Adds every file in the folder. Subfolders are included when the browser lists them.</span>
+  </div>
+  <input id="folder-input" class="sr" type="file" multiple webkitdirectory directory aria-label="Choose a folder of files">
   <fieldset>
     <legend>How to strip</legend>
     <label class="choice"><input type="radio" name="mode" value="lossless" checked> <span><strong>Lossless.</strong> Remove metadata segments, chunks, and atoms. Image and audio data stay encoded as they were.</span></label>
@@ -199,6 +218,18 @@ footer a { color: var(--accent); }
     <button type="button" id="strip" disabled>Strip and re-scan</button>
     <button type="button" id="zip" class="secondary" disabled>Download zip</button>
   </div>
+  <fieldset>
+    <legend>Clean pack</legend>
+    <p id="pack-help">After a strip, this builds a zip of the outputs and a manifest (JSON, CSV, and a text file for a report appendix). The manifest lists field names that were removed, not the values that were stored in them. Folder paths are never written.</p>
+    <label class="choice"><input type="checkbox" id="neutral-names" checked> <span><strong>Neutral filenames.</strong> Rename each output to a prefix and a sequence number, so the original file name is not in the zip.</span></label>
+    <label class="prefix-line" for="name-prefix">Prefix <input id="name-prefix" type="text" value="photo" maxlength="40" autocomplete="off" spellcheck="false" aria-describedby="pack-note"></label>
+    <label class="choice"><input type="checkbox" id="manifest-names"> <span><strong>Include original filenames in the manifest.</strong> Off unless you need the mapping. Only the file's own name is written, not the folder it came from.</span></label>
+    <label class="choice"><input type="checkbox" id="manifest-original-hash"> <span><strong>Include a SHA-256 of each original file.</strong> Off unless you need it. The original bytes are not put in the zip.</span></label>
+    <p id="pack-note" aria-live="polite"></p>
+    <div class="actions">
+      <button type="button" id="clean-pack" class="secondary" disabled>Download clean pack</button>
+    </div>
+  </fieldset>
   <p id="status" role="status" aria-live="polite"></p>
   <p id="summary" aria-live="polite"></p>
 </section>
