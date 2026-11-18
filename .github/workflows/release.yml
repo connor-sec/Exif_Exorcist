@@ -17,8 +17,73 @@ jobs:
         with:
           persist-credentials: false
 
+      # Tag v1.1 attaches Exif-Exorcist-v1.1.html. The page badge must be that
+      # tag. The engine constant stays the three-part form already used in
+      # v1.0 (var VERSION = '1.0.0'), so a two-part tag uses patch 0.
+      - name: Resolve the release asset from the tag
+        id: asset
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            echo "::error title=Not a tag push::This release job only attaches an asset for a tag push."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error title=Unsupported tag::Tag '${TAG}' is not a version tag. Expected vMAJOR.MINOR or vMAJOR.MINOR.PATCH, for example v1.1."
+            exit 1
+          fi
+
+          asset="Exif-Exorcist-${TAG}.html"
+          if [[ ! "$asset" =~ ^Exif-Exorcist-v[0-9]+\.[0-9]+(\.[0-9]+)?\.html$ || "$asset" == *"/"* ]]; then
+            echo "::error title=Release asset missing::Refusing to use '${asset}' from tag ${TAG} as a release asset."
+            exit 1
+          fi
+          if [[ -L "$asset" ]]; then
+            echo "::error title=Release asset missing::${asset} is a symlink. The release asset must be a regular file in the repository root."
+            exit 1
+          fi
+          if [[ ! -f "$asset" ]]; then
+            echo "::error title=Release asset missing::Tag ${TAG} requires ${asset} in the repository root. That file does not exist, so nothing was attached. This workflow does not fall back to another version."
+            exit 1
+          fi
+
+          numeric="${TAG#v}"
+          if [[ "$numeric" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            semver="${numeric}.0"
+          else
+            semver="$numeric"
+          fi
+
+          expected_badge="<span class=\"version\">${TAG}</span>"
+          mapfile -t badges < <(grep -oE '<span class="version">[^<]*</span>' "$asset" || true)
+          if [[ ${#badges[@]} -ne 1 || "${badges[0]}" != "$expected_badge" ]]; then
+            echo "::error title=Version string mismatch::${asset} version string does not match tag ${TAG}. Expected ${expected_badge}. Found ${badges[*]:-<none>}."
+            exit 1
+          fi
+
+          expected_title="<title>Exif Exorcist ${TAG}</title>"
+          mapfile -t titles < <(grep -oE '<title>[^<]*</title>' "$asset" || true)
+          if [[ ${#titles[@]} -ne 1 || "${titles[0]}" != "$expected_title" ]]; then
+            echo "::error title=Version string mismatch::${asset} title does not match tag ${TAG}. Expected ${expected_title}. Found ${titles[*]:-<none>}."
+            exit 1
+          fi
+
+          expected_constant="var VERSION = '${semver}';"
+          mapfile -t constants < <(grep -oE "var VERSION = '[^']*';" "$asset" || true)
+          if [[ ${#constants[@]} -ne 1 || "${constants[0]}" != "$expected_constant" ]]; then
+            echo "::error title=Version string mismatch::${asset} engine version does not match tag ${TAG}. Expected ${expected_constant}. Found ${constants[*]:-<none>}."
+            exit 1
+          fi
+
+          printf 'asset=%s\n' "$asset" >> "$GITHUB_OUTPUT"
+          echo "Release asset ${asset} matches tag ${TAG} (engine version ${semver})."
+
       - name: Attach the HTML file to the GitHub Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: Exif-Exorcist-v1.0.html
+          files: ${{ steps.asset.outputs.asset }}
           fail_on_unmatched_files: true

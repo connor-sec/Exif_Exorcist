@@ -1,0 +1,27 @@
+# The single-file builds (Exif-Exorcist-v*.html) are tracked on purpose.
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Node
+node_modules/
+
+# Logs
+*.log
