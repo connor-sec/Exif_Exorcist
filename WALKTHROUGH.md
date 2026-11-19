@@ -2,7 +2,7 @@
 
 A step-by-step walkthrough of a common workflow in **[Exif Exorcist](https://github.com/connor-sec/Exif_Exorcist)**: drop a photo, read the GPS and serial-number rows, strip the metadata containers, read the re-scan, and download the result. A second pass shows the canvas re-encode and why a best-effort file is not certified.
 
-Exif Exorcist is a single, offline HTML file — open `Exif-Exorcist-v1.0.html` in any modern browser. No install, no server, nothing leaves the page. Opening it from a `file://` URL is the normal way to use it.
+Exif Exorcist is a single, offline HTML file. Build it with `node scripts/build_html.mjs` (that writes `Exif-Exorcist-v1.0.html`), or download the HTML attached to a release, then open that file in any modern browser. No install, no server, nothing leaves the page. Opening it from a `file://` URL is the normal way to use it.
 
 > **⚠️ Authorized use only.** Use it on files you are allowed to modify. It does not upload them, and it does not redact what a person can see in the picture or on the page. “No metadata detected” means a second scan of a fully supported format found nothing. Check the file with another tool before you rely on it.
 
@@ -21,7 +21,7 @@ Exif Exorcist is a single, offline HTML file — open `Exif-Exorcist-v1.0.html` 
 
 ## Step 1 — Drop the files
 
-Open `Exif-Exorcist-v1.0.html`. The drop area is a button: click it, or press Enter or Space while it is focused, and choose files. You can also drag several files onto it.
+Open the built `Exif-Exorcist-v1.0.html` (see the repository README for the build command). The drop area is a button: click it, or press Enter or Space while it is focused, and choose files. You can also drag several files onto it.
 
 A PNG named `photo.jpg` is still a PNG. The badge on the card is the type from the magic bytes.
 

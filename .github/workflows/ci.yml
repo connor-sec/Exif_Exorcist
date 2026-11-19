@@ -40,5 +40,58 @@ jobs:
             qpdf \
             unzip
 
+      - name: Build the single-file page
+        run: node scripts/build_html.mjs
+
+      - name: Confirm the build is reproducible
+        run: |
+          set -euo pipefail
+          cp Exif-Exorcist-v1.0.html /tmp/exif-exorcist-first.html
+          node scripts/build_html.mjs
+          cmp /tmp/exif-exorcist-first.html Exif-Exorcist-v1.0.html
+
+      - name: Confirm a version tag stamps the badge, title, and engine version
+        run: |
+          set -euo pipefail
+          check() {
+            local tag="$1"
+            local semver="$2"
+            local asset="Exif-Exorcist-${tag}.html"
+            node scripts/build_html.mjs "$tag"
+            if [[ -L "$asset" || ! -f "$asset" ]]; then
+              echo "::error title=Build output missing::${asset} was not written as a regular file."
+              exit 1
+            fi
+            mapfile -t badges < <(grep -oE '<span class="version">[^<]*</span>' "$asset" || true)
+            if [[ ${#badges[@]} -ne 1 || "${badges[0]}" != "<span class=\"version\">${tag}</span>" ]]; then
+              echo "::error title=Version string mismatch::${asset} badge is ${badges[*]:-<none>}."
+              exit 1
+            fi
+            mapfile -t titles < <(grep -oE '<title>[^<]*</title>' "$asset" || true)
+            if [[ ${#titles[@]} -ne 1 || "${titles[0]}" != "<title>Exif Exorcist ${tag}</title>" ]]; then
+              echo "::error title=Version string mismatch::${asset} title is ${titles[*]:-<none>}."
+              exit 1
+            fi
+            mapfile -t constants < <(grep -oE "var VERSION = '[^']*';" "$asset" || true)
+            if [[ ${#constants[@]} -ne 1 || "${constants[0]}" != "var VERSION = '${semver}';" ]]; then
+              echo "::error title=Version string mismatch::${asset} engine version is ${constants[*]:-<none>}."
+              exit 1
+            fi
+            rm -f "$asset"
+          }
+          check v1.1 1.1.0
+          check v1.2.3 1.2.3
+          test -f Exif-Exorcist-v1.0.html
+
+      - name: Confirm the build does not change tracked files
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [[ -n "$dirty" ]]; then
+            echo "::error title=Dirty tree::The build left tracked changes:"
+            printf '%s\n' "$dirty"
+            exit 1
+          fi
+
       - name: Run tests
         run: node tests/run_tests.mjs

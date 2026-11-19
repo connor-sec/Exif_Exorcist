@@ -1,4 +1,6 @@
-# The single-file builds (Exif-Exorcist-v*.html) are tracked on purpose.
+# Built single-file pages. scripts/build_html.mjs writes these.
+# CI builds one to test, and the release workflow builds the tag's file.
+Exif-Exorcist-v*.html
 
 # macOS / Windows
 .DS_Store
