@@ -14,7 +14,7 @@ Report security vulnerabilities privately through GitHub Security Advisories:
 
 [Open a security advisory](https://github.com/connor-sec/Exif_Exorcist/security/advisories/new)
 
-Describe the issue, the version you tested (`Exif-Exorcist-v1.0.html` or the tag you built), and how to reproduce it. Do not open a public issue, pull request, or discussion for a report that should stay private.
+Describe the issue, the version you tested (the release tag, or the `Exif-Exorcist-v*.html` file you built), and how to reproduce it. Do not open a public issue, pull request, or discussion for a report that should stay private.
 
 ## Authorized use
 

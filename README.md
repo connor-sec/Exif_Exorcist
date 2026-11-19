@@ -6,11 +6,11 @@ An offline, single-file HTML tool that strips metadata from files in your browse
 
 Maintained by [@connor-sec](https://github.com/connor-sec).
 
-> **Download:** the single-file build is [Exif-Exorcist-v1.0.html](Exif-Exorcist-v1.0.html) in this repository, and the same file is attached to [Releases](https://github.com/connor-sec/Exif_Exorcist/releases) when a version tag is pushed.
+> **Download:** the built HTML is not stored in this repository. Run `node scripts/build_html.mjs` to write `Exif-Exorcist-v1.0.html` (see [Development](#development)), or download the HTML file attached to a [Release](https://github.com/connor-sec/Exif_Exorcist/releases).
 
 ## Usage
 
-Open `Exif-Exorcist-v1.0.html` in any modern browser. That's it — no install, no server. It also works from a `file://` URL.
+Open the built `Exif-Exorcist-v1.0.html`, or the HTML file from a release, in any modern browser. That's it — no install, no server. It also works from a `file://` URL.
 
 To prepare a folder of photos for a report, choose the folder, strip, then download a clean pack. The pack is a zip of the stripped files and a manifest. [Clean pack](#clean-pack) describes what that zip contains and what it leaves out.
 
@@ -97,14 +97,14 @@ AVIF, BigTIFF, encrypted PDF, ZIP64, and ZIP files that are not Office or ODF pa
 
 ## Development
 
-The page is one file. `src/engine.js` and `src/engine2.js` are the same script, split so the tests can read it. `node tests/build_html.mjs` writes `Exif-Exorcist-v1.0.html`. The test fails if the HTML and `src/` drift.
+The page is one file, built from `src/`. It is not committed. `src/engine-raster.js` is the utilities and the JPEG, PNG, GIF, WebP, and TIFF strip and scan helpers. `src/engine-containers.js` is the containers (ISO-BMFF), PDF, clean pack, and the public API. They are one script, split so the tests can read it. `node scripts/build_html.mjs` concatenates those files with `src/shell.html` and `src/ui.js` and writes `Exif-Exorcist-v1.0.html`. Pass a version tag to build a release file: `node scripts/build_html.mjs v1.1` writes `Exif-Exorcist-v1.1.html` and sets the badge, the title, the engine `VERSION`, and the other v1.0 labels on the page for that tag. A two-part tag uses patch 0, so `v1.1` is engine `1.1.0`. The test fails if the default HTML and `src/` drift.
 
 ```
-node tests/build_html.mjs
+node scripts/build_html.mjs
 node tests/run_tests.mjs
 ```
 
-The tests generate sample files, strip them with the script inside the HTML file, and check the outputs with ExifTool. They expect `exiftool`, `ffmpeg`, `qpdf`, Python 3, Pillow, and piexif on the machine running them.
+The tests generate sample files, strip them with the script inside the HTML file, and check the outputs with ExifTool. They expect `exiftool`, `ffmpeg`, `qpdf`, Python 3, Pillow, and piexif on the machine running them. Build the HTML before running the tests.
 
 ## Acknowledgments & Credits
 

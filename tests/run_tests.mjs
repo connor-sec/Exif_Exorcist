@@ -9,9 +9,9 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const htmlPath = join(root, 'Exif-Exorcist-v1.0.html');
 const html = readFileSync(htmlPath, 'utf8');
 const engine = html.split('/* EXIF_EXORCIST_ENGINE_START */')[1].split('/* EXIF_EXORCIST_ENGINE_END */')[0];
-const src = readFileSync(join(root, 'src/engine.js'), 'utf8') + '\n' + readFileSync(join(root, 'src/engine2.js'), 'utf8') + '\n';
+const src = readFileSync(join(root, 'src/engine-raster.js'), 'utf8') + '\n' + readFileSync(join(root, 'src/engine-containers.js'), 'utf8') + '\n';
 if (engine.trim() !== src.trim()) {
-  throw new Error('Exif-Exorcist-v1.0.html engine does not match src/. Run node tests/build_html.mjs.');
+  throw new Error('Exif-Exorcist-v1.0.html engine does not match src/. Run node scripts/build_html.mjs.');
 }
 eval(engine);
 const EE = globalThis.ExifExorcist;
@@ -810,7 +810,7 @@ function buildPdf(objs) {
 { // The page is built from all three sources, not only the engine.
   const shell = readFileSync(join(root, 'src/shell.html'), 'utf8');
   const ui = readFileSync(join(root, 'src/ui.js'), 'utf8');
-  assert(html === shell.replace('@@ENGINE@@', () => src).replace('@@UI@@', () => ui), 'Exif-Exorcist-v1.0.html matches src/shell.html, src/engine*.js, and src/ui.js. Run node tests/build_html.mjs.');
+  assert(html === shell.replace('@@ENGINE@@', () => src).replace('@@UI@@', () => ui), 'Exif-Exorcist-v1.0.html matches src/shell.html, src/engine-raster.js, src/engine-containers.js, and src/ui.js. Run node scripts/build_html.mjs.');
 }
 
 rmSync(work, { recursive: true, force: true });

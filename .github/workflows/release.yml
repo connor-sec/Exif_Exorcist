@@ -17,9 +17,33 @@ jobs:
         with:
           persist-credentials: false
 
-      # Tag v1.1 attaches Exif-Exorcist-v1.1.html. The page badge must be that
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      # Tag v1.1 builds Exif-Exorcist-v1.1.html. The page badge must be that
       # tag. The engine constant stays the three-part form already used in
       # v1.0 (var VERSION = '1.0.0'), so a two-part tag uses patch 0.
+      - name: Build the release HTML from the tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE:-}" != "tag" ]]; then
+            echo "::error title=Not a tag push::This release job only builds an asset for a tag push."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error title=Unsupported tag::Tag '${TAG}' is not a version tag. Expected vMAJOR.MINOR or vMAJOR.MINOR.PATCH, for example v1.1."
+            exit 1
+          fi
+
+          node scripts/build_html.mjs "$TAG"
+
       - name: Resolve the release asset from the tag
         id: asset
         shell: bash
@@ -47,7 +71,7 @@ jobs:
             exit 1
           fi
           if [[ ! -f "$asset" ]]; then
-            echo "::error title=Release asset missing::Tag ${TAG} requires ${asset} in the repository root. That file does not exist, so nothing was attached. This workflow does not fall back to another version."
+            echo "::error title=Release asset missing::The build for tag ${TAG} did not produce ${asset} in the repository root. Nothing was attached. This workflow does not fall back to another version."
             exit 1
           fi
 
